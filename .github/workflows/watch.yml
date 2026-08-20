@@ -35,4 +35,5 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add seen_lots.json subscribers.json
           git diff --cached --quiet || git commit -m "update state"
+          git pull --rebase --autostash origin main
           git push
