@@ -1,1 +1,38 @@
+name: Auction watcher
 
+on:
+  schedule:
+    # каждые 15 минут, время UTC. GitHub может запускать с опозданием на несколько
+    # минут в часы пик - это нормально для бесплатного плана. Именно с такой частотой
+    # бот проверяет и новые команды (/watch, /mywatches, /unwatch), и новые лоты.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run watcher
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python watcher.py
+
+      - name: Save state (subscribers + seen lots)
+        run: |
+          git config user.name "auction-watcher-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add seen_lots.json subscribers.json
+          git diff --cached --quiet || git commit -m "update state"
+          git push
