@@ -149,13 +149,14 @@ _cache = {
 # --------------------------------------------------------------------------
 
 
-def _pick_remote_file(ftp):
-    """Возвращает имя файла архива на FTP: либо ALEADO_FTP_FILENAME, если
-    задан явно, либо самый свежий *.bz2 в ALEADO_FTP_DIR."""
-    if FTP_FILENAME:
-        return FTP_FILENAME
-
+def _list_candidates(ftp):
+    """Возвращает (все_имена_в_папке, отсортированный_список_bz2_кандидатов
+    от самого свежего к самому старому). Логирует полный листинг папки —
+    это единственный способ понять, что реально лежит на FTP и что из
+    этого видно аккаунту, если потом какой-то конкретный файл откажется
+    скачиваться (см. download_dump)."""
     names = ftp.nlst()
+    log.info("aleado: листинг папки %r на FTP (%d файлов): %s", FTP_DIR, len(names), names)
     candidates = [n for n in names if n.lower().endswith((".bz2", ".sql.bz2"))]
     if not candidates:
         raise RuntimeError(
@@ -174,12 +175,20 @@ def _pick_remote_file(ftp):
         except Exception:
             return ""
 
-    candidates.sort(key=lambda n: (mtime_key(n), n))
-    return candidates[-1]
+    candidates.sort(key=lambda n: (mtime_key(n), n), reverse=True)
+    return names, candidates
 
 
 def download_dump(local_dir):
-    """Скачивает архив с FTP в local_dir, возвращает путь к .bz2 файлу."""
+    """Скачивает архив с FTP в local_dir, возвращает путь к .bz2 файлу.
+
+    Если конкретное имя не задано через ALEADO_FTP_FILENAME, перебираем
+    все найденные *.bz2 от самого свежего к самому старому: некоторые
+    файлы в папке могут оказаться недоступны конкретному аккаунту на
+    чтение (сервер отвечает "550 ... Permission denied" на RETR при
+    полностью успешном логине и листинге — такое бывает, если в одной
+    папке лежат дампы разных тарифов/клиентов) — в этом случае просто
+    пробуем следующий кандидат, а не падаем сразу."""
     if not FTP_HOST:
         raise RuntimeError("ALEADO_FTP_HOST не задан.")
 
@@ -189,13 +198,40 @@ def download_dump(local_dir):
     try:
         if FTP_DIR and FTP_DIR != "/":
             ftp.cwd(FTP_DIR)
-        remote_name = _pick_remote_file(ftp)
-        local_path = os.path.join(local_dir, os.path.basename(remote_name))
-        log.info("aleado: скачиваю %s ...", remote_name)
-        with open(local_path, "wb") as f:
-            ftp.retrbinary("RETR " + remote_name, f.write)
-        log.info("aleado: скачано %s (%d байт)", local_path, os.path.getsize(local_path))
-        return local_path
+
+        if FTP_FILENAME:
+            remote_names = [FTP_FILENAME]
+        else:
+            _, remote_names = _list_candidates(ftp)
+
+        errors = []
+        for remote_name in remote_names:
+            local_path = os.path.join(local_dir, os.path.basename(remote_name))
+            log.info("aleado: скачиваю %s ...", remote_name)
+            try:
+                with open(local_path, "wb") as f:
+                    ftp.retrbinary("RETR " + remote_name, f.write)
+            except ftplib.error_perm as e:
+                log.warning(
+                    "aleado: файл %s недоступен для скачивания этому аккаунту (%s) — "
+                    "пробую следующий кандидат, если есть",
+                    remote_name, e,
+                )
+                errors.append("{}: {}".format(remote_name, e))
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+                continue
+            log.info("aleado: скачано %s (%d байт)", local_path, os.path.getsize(local_path))
+            return local_path
+
+        raise RuntimeError(
+            "Ни один из найденных файлов *.bz2 не скачался: {}. "
+            "Похоже, аккаунту {!r} не разрешено читать (RETR) ни один из этих файлов на "
+            "FTP, хотя логин и листинг папки прошли успешно — уточните у поставщика "
+            "точное имя файла для этого аккаунта.".format("; ".join(errors), FTP_USER)
+        )
     finally:
         try:
             ftp.quit()
