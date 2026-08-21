@@ -5,3 +5,7 @@ charset-normalizer==2.0.12
 idna==3.10
 certifi==2025.4.26
 PyMySQL==1.1.1
+# Нужен PyMySQL для аутентификации caching_sha2_password/sha256_password —
+# именно её по умолчанию использует MySQL 8 (сервис MySQL на Railway),
+# без этого пакета bot_server.py падает при первом же подключении к БД.
+cryptography>=42.0.0
