@@ -107,10 +107,15 @@ MYSQL_DB = db.MYSQL_DB
 # несколько лишних кандидатов, чем не найти реальную колонку.
 FIELD_CANDIDATES = {
     "lot_id": ["id", "lot_id", "id_lot", "lotid", "lot_id_ns"],
-    "lot_number": ["lot_number", "lot_no", "lotno", "number", "lot"],
+    # "bid" — реальное имя в дампе aleado для номера лота (напр. "0260",
+    # используется и в ссылках на фото); ничего общего со ставкой на
+    # торгах, несмотря на название.
+    "lot_number": ["lot_number", "lot_no", "lotno", "number", "lot", "bid"],
     "auction_date": ["date", "auction_date", "sale_date", "aukцион_date", "adate"],
     "auction_name": ["auction", "auction_name", "auction_house", "place"],
-    "brand": ["make", "brand", "marka", "maker", "manufacturer"],
+    # "company_en" — реальное имя колонки с маркой в дампе aleado
+    # (значения вида "Honda"/"Yamaha"), подтверждено по примеру строки.
+    "brand": ["make", "brand", "marka", "maker", "manufacturer", "company_en"],
     "model": ["model", "model_name", "modelname"],
     "year": ["year", "model_year", "year_model", "yr"],
     "body_type": ["body_type", "frame_type", "body", "frame", "type"],
@@ -122,12 +127,23 @@ FIELD_CANDIDATES = {
         "result_price", "endprice", "price",
     ],
     "color": ["color", "colour"],
-    "grade_overall": ["grade", "overall_grade", "score", "rank", "rating"],
+    # "scores_en" — реальная общая оценка лота (значения вида "6"); идёт
+    # первым, чтобы точный матч по имени колонки перебил менее точное
+    # совпадение по подстроке "grade" с "model_grade_en" (которая у
+    # aleado почти всегда пустая — это отдельное текстовое поле, не
+    # общая оценка).
+    "grade_overall": ["scores_en", "grade", "overall_grade", "score", "rank", "rating"],
     "result": ["result", "sale_result", "status", "torgi_result"],
     "vin": ["vin", "chassis", "chassis_no", "frame_no"],
     "photo_url": ["photo", "photo_url", "photos", "image", "img", "picture", "pic_url", "pics"],
-    "description_en": ["description_en", "desc_en", "comment_en", "note_en"],
-    "description_ru": ["description_ru", "desc_ru", "comment_ru", "note_ru", "description", "comment"],
+    # "parsed_data_en"/"parsed_data_ru" — реальные поля aleado с разбором
+    # состояния лота (структурированный текст: пояснения по узлам,
+    # ссылки на видео, история цен и т.п.), английская и русская версии.
+    "description_en": ["description_en", "desc_en", "comment_en", "note_en", "parsed_data_en"],
+    "description_ru": [
+        "description_ru", "desc_ru", "comment_ru", "note_ru", "description", "comment",
+        "parsed_data_ru",
+    ],
 }
 
 # Колонки, которые дополнительно подсвечиваем в уведомлении, если их имя
