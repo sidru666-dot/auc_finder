@@ -135,7 +135,17 @@ FIELD_CANDIDATES = {
     "grade_overall": ["scores_en", "grade", "overall_grade", "score", "rank", "rating"],
     "result": ["result", "sale_result", "status", "torgi_result"],
     "vin": ["vin", "chassis", "chassis_no", "frame_no"],
-    "photo_url": ["photo", "photo_url", "photos", "image", "img", "picture", "pic_url", "pics"],
+    # "pictures" — реальное имя колонки в дампе aleado со ссылками на
+    # фото лота (подтверждено по примеру строки): значение — список
+    # ссылок вида https://p3.aleado.com/p3/MotoPicGetter?...&npic=N&url=,
+    # склеенных через "#" (не запятую!) — см. lot_photo() в bot_server.py,
+    # которая это разбирает. Указано первым явным кандидатом, чтобы точный
+    # матч по имени колонки не зависел от порядка колонок в таблице (без
+    # этого разрешение подстрокой могло в теории зацепить не ту колонку).
+    "photo_url": [
+        "pictures", "photo", "photo_url", "photos", "image", "img",
+        "picture", "pic_url", "pics",
+    ],
     # "parsed_data_en"/"parsed_data_ru" — реальные поля aleado с разбором
     # состояния лота (структурированный текст: пояснения по узлам,
     # ссылки на видео, история цен и т.п.), английская и русская версии.

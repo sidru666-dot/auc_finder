@@ -105,8 +105,10 @@ if not TELEGRAM_TOKEN:
 # кэшем, пока он не устареет.
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "300"))
 
-# Сколько лотов показывать за раз в мгновенном просмотре ("Показать сейчас").
-PREVIEW_LIMIT = 15
+# Сколько лотов отправлять за один раз (и в мгновенном просмотре, и в
+# фоновых уведомлениях) — дальше показываем по кнопке "Показать ещё",
+# а не высыпаем все найденные лоты одним потоком сообщений подряд.
+BATCH_SIZE = 10
 
 # Сколько разных моделей показывать кнопками под маркой.
 MODEL_BUTTON_LIMIT = 18
@@ -200,22 +202,48 @@ def format_rub(v):
     return "{:,.0f}".format(v).replace(",", " ")
 
 
-def describe_criteria(brand, model, year_from, year_to, max_price):
+def describe_criteria(brand, model, year_from, year_to, max_price, extra=None):
     model_s = model or "любая модель"
     years = "{}–{}".format(year_from or "…", year_to or "…") if (year_from or year_to) else "любые годы"
     price_s = "до {} ₽".format(format_rub(max_price)) if max_price else "без ограничения по цене"
-    return "{} / {} [{}] {}".format(brand, model_s, years, price_s)
+    base = "{} / {} [{}] {}".format(brand, model_s, years, price_s)
+    return base + "; " + extra if extra else base
+
+
+def describe_extra(w):
+    """Доп. критерии (пробег/объём/оценка/лот/VIN/текст) — те же поля,
+    что в форме поиска на jmmoto.ru, отдельной строкой, если заданы."""
+    parts = []
+    if w.get("mileage_from") or w.get("mileage_to"):
+        parts.append("пробег {}–{} км".format(w.get("mileage_from") or "…", w.get("mileage_to") or "…"))
+    if w.get("engine_from") or w.get("engine_to"):
+        parts.append("объём {}–{} см³".format(w.get("engine_from") or "…", w.get("engine_to") or "…"))
+    if w.get("grade_from") is not None or w.get("grade_to") is not None:
+        gf = w.get("grade_from")
+        gt = w.get("grade_to")
+        if gf is not None or gt is not None:
+            parts.append("оценка {}–{}".format(gf if gf is not None else "…", gt if gt is not None else "…"))
+    if w.get("lot_number"):
+        parts.append("лот №{}".format(w["lot_number"]))
+    if w.get("vin"):
+        parts.append("VIN {}".format(w["vin"]))
+    if w.get("free_text"):
+        parts.append('текст "{}"'.format(w["free_text"]))
+    return ", ".join(parts)
 
 
 def describe_watch(w):
     return "#{}: {}".format(
         w["id"],
-        describe_criteria(w["brand"], w.get("model"), w.get("year_from"), w.get("year_to"), w.get("max_price")),
+        describe_criteria(
+            w["brand"], w.get("model"), w.get("year_from"), w.get("year_to"), w.get("max_price"),
+            extra=describe_extra(w),
+        ),
     )
 
 
-def matches(watch, brand, model_text, year, price):
-    if watch["brand"].lower() != brand.lower():
+def matches(watch, brand, model_text, year, price, lot=None):
+    if (watch.get("brand") or "").lower() != brand.lower():
         return False
     if watch.get("model"):
         if not model_text or watch["model"].lower() not in model_text.lower():
@@ -226,6 +254,53 @@ def matches(watch, brand, model_text, year, price):
         return False
     if watch.get("max_price") and (price is None or price > watch["max_price"]):
         return False
+
+    if lot is None:
+        return True
+
+    if watch.get("mileage_from") or watch.get("mileage_to"):
+        mileage = parse_price(lot.get("mileage"))
+        if mileage is None:
+            return False
+        if watch.get("mileage_from") and mileage < watch["mileage_from"]:
+            return False
+        if watch.get("mileage_to") and mileage > watch["mileage_to"]:
+            return False
+
+    if watch.get("engine_from") or watch.get("engine_to"):
+        engine = parse_price(lot.get("engine_volume"))
+        if engine is None:
+            return False
+        if watch.get("engine_from") and engine < watch["engine_from"]:
+            return False
+        if watch.get("engine_to") and engine > watch["engine_to"]:
+            return False
+
+    if watch.get("grade_from") is not None or watch.get("grade_to") is not None:
+        grade = parse_price(lot.get("grade_overall"))
+        if grade is None:
+            return False
+        if watch.get("grade_from") is not None and grade < watch["grade_from"]:
+            return False
+        if watch.get("grade_to") is not None and grade > watch["grade_to"]:
+            return False
+
+    if watch.get("lot_number"):
+        if not lot.get("lot_number") or watch["lot_number"].lower() not in str(lot["lot_number"]).lower():
+            return False
+
+    if watch.get("vin"):
+        if not lot.get("vin") or watch["vin"].lower() not in str(lot["vin"]).lower():
+            return False
+
+    if watch.get("free_text"):
+        haystack = " ".join(
+            str(lot.get(k) or "") for k in
+            ("description_en", "description_ru", "model", "brand", "auction_name")
+        ).lower()
+        if watch["free_text"].lower() not in haystack:
+            return False
+
     return True
 
 
@@ -292,23 +367,68 @@ def lot_grade_label(lot):
     return ", ".join(parts) if parts else None
 
 
-def lot_photo(lot):
+# Реальные фото лота (поле pictures у aleado) склеены знаком "#", а НЕ
+# запятой — важно, иначе вся склейка из нескольких ссылок улетает в
+# Telegram одной "битой" строкой и фото не показывается вовсе, либо
+# показывается не то, что нужно. На всякий случай поддерживаем и другие
+# возможные разделители, если формат когда-нибудь поменяется.
+_PHOTO_SEPARATORS = ("#", ",", ";", "|", "\n")
+
+# Схемы повреждений/техосмотра (например, от аукционного дома BDS) — это
+# ДРУГОЙ набор картинок, встроенный в текст description_en/ru (поле
+# parsed_data_en/ru), не в pictures. Он никогда не должен использоваться
+# как фото лота, но на случай, если он всё же просочится через
+# resolve_columns (например, поставщик переименует колонки) —
+# подстраховываемся и просто отбрасываем ссылки с этих доменов/путей.
+_DIAGRAM_URL_HINTS = ("jupiter.ac", "bdsc", "disp/bds", "image_item")
+
+
+def lot_photos(lot):
+    """Все ссылки на реальные фото лота (может быть несколько ракурсов),
+    без диаграмм повреждений."""
     raw = lot.get("photo_url")
     if not raw:
-        return None
+        return []
     raw = str(raw)
-    for sep in (",", ";", "|", "\n"):
-        if sep in raw:
-            raw = raw.split(sep)[0]
-            break
-    raw = raw.strip()
-    return raw or None
+    for sep in _PHOTO_SEPARATORS[1:]:
+        raw = raw.replace(sep, "#")
+    urls = []
+    for part in raw.split("#"):
+        part = part.strip()
+        if not part or not part.lower().startswith(("http://", "https://")):
+            continue
+        if any(hint in part.lower() for hint in _DIAGRAM_URL_HINTS):
+            continue
+        urls.append(part)
+    return urls
+
+
+def lot_photo(lot):
+    """Первое (главное) фото лота для превью, либо None."""
+    urls = lot_photos(lot)
+    return urls[0] if urls else None
 
 
 def lot_display_name(lot):
     brand = (lot.get("brand") or "?").strip()
     model = (lot.get("model") or "").strip()
     return "{} {}".format(brand, model).strip()
+
+
+# Сайт-первоисточник этих же данных (тот же поставщик, что и у фида
+# aleado). ТОЧНЫЙ формат ссылки на карточку конкретного лота на сайте
+# пока не подтверждён — используем поиск по номеру лота на главной как
+# рабочий вариант, чтобы ссылка уже сейчас вела в нужную сторону. Как
+# только пришлёте пример реальной ссылки на лот с jmmoto.ru — поправлю
+# на точный прямой адрес карточки лота.
+JMMOTO_BASE_URL = "https://jmmoto.ru/"
+
+
+def lot_jmmoto_url(lot):
+    lot_number = (lot.get("lot_number") or "").strip()
+    if lot_number:
+        return "{}?search={}".format(JMMOTO_BASE_URL, lot_number)
+    return JMMOTO_BASE_URL
 
 
 def fetch_model_candidates(brand, limit=MODEL_BUTTON_LIMIT):
@@ -372,7 +492,11 @@ def format_lot_text(lot, brand, model, year):
     if lot.get("result"):
         lines.append("Результат торгов: {}".format(html.escape(str(lot["result"]))))
 
-    lines.append("Источник: aleado (Япония)")
+    lines.append(
+        '<a href="{}">Смотреть на jmmoto.ru</a> | Источник: aleado (Япония)'.format(
+            html.escape(lot_jmmoto_url(lot), quote=True)
+        )
+    )
     return "\n".join(lines)
 
 
@@ -394,6 +518,67 @@ def send_lot(bot, chat_id, text, photo_url=None):
         log.warning("send_message failed for chat %s: %s", chat_id, e)
 
 
+# --------------------------------------------------------------------------
+# Показ лотов порциями по BATCH_SIZE (и в фоновых уведомлениях, и в
+# мгновенном просмотре) — вместо того, чтобы высыпать все найденные лоты
+# одним потоком сообщений подряд, показываем по BATCH_SIZE штук и ждём
+# нажатия "Показать ещё"/"Прекратить".
+# --------------------------------------------------------------------------
+
+PENDING_LOTS = {}  # chat_id -> список {"text":..., "photo":...}, ещё не показанных
+
+
+def batch_kb(remaining):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "▶️ Показать ещё {} (осталось {})".format(min(BATCH_SIZE, remaining), remaining),
+            callback_data="morelots",
+        )],
+        [InlineKeyboardButton("⏹ Прекратить показ", callback_data="stoplots")],
+    ])
+
+
+def send_lots_batch(bot, chat_id):
+    """Отправляет очередную порцию (до BATCH_SIZE) лотов из очереди
+    PENDING_LOTS[chat_id]; если после неё в очереди ещё что-то осталось —
+    добавляет кнопки "Показать ещё"/"Прекратить показ"."""
+    queue = PENDING_LOTS.get(chat_id) or []
+    if not queue:
+        PENDING_LOTS.pop(chat_id, None)
+        return
+    batch, rest = queue[:BATCH_SIZE], queue[BATCH_SIZE:]
+    if rest:
+        PENDING_LOTS[chat_id] = rest
+    else:
+        PENDING_LOTS.pop(chat_id, None)
+
+    for item in batch:
+        send_lot(bot, chat_id, item["text"], item.get("photo"))
+
+    if rest:
+        try:
+            bot.send_message(
+                chat_id=chat_id,
+                text="Показано {} лотов, осталось ещё {}.".format(len(batch), len(rest)),
+                reply_markup=batch_kb(len(rest)),
+            )
+        except Exception as e:
+            log.warning("batch control message failed for chat %s: %s", chat_id, e)
+
+
+def enqueue_lots(bot, chat_id, items):
+    """Кладёт лоты в очередь показа для chat_id. Если очередь была
+    пустой — сразу отправляет первую порцию; если у пользователя уже
+    есть непросмотренная порция — просто дописывает в конец, не шлём
+    вторую порцию поверх ещё не просмотренной."""
+    if not items:
+        return
+    was_empty = not PENDING_LOTS.get(chat_id)
+    PENDING_LOTS.setdefault(chat_id, []).extend(items)
+    if was_empty:
+        send_lots_batch(bot, chat_id)
+
+
 def check_all(bot):
     watches = db.list_watches()
     if not watches:
@@ -411,6 +596,7 @@ def check_all(bot):
     # превращается в тысячи соединений за один проход).
     seen = db.list_seen_keys()
     newly_seen = []
+    by_chat = {}
 
     for lot in lots:
         lot_id = lot.get("lot_id") or lot.get("lot_number")
@@ -422,7 +608,7 @@ def check_all(bot):
         price = lot_price_rub(lot)
 
         for w in watches:
-            if not matches(w, brand, model, year, price):
+            if not matches(w, brand, model, year, price, lot=lot):
                 continue
             key = "aleado:{}:{}".format(lot_id, w["chat_id"])
             if key in seen:
@@ -430,9 +616,12 @@ def check_all(bot):
             seen.add(key)
             newly_seen.append(key)
             text = format_lot_text(lot, brand, model, year)
-            send_lot(bot, w["chat_id"], text, lot_photo(lot))
+            by_chat.setdefault(w["chat_id"], []).append({"text": text, "photo": lot_photo(lot)})
 
     db.mark_seen_bulk(newly_seen)
+
+    for chat_id, items in by_chat.items():
+        enqueue_lots(bot, chat_id, items)
 
 
 def check_job(context: CallbackContext):
@@ -447,14 +636,19 @@ def check_job(context: CallbackContext):
 # --------------------------------------------------------------------------
 
 
-def format_preview(brand, model, year_from, year_to, max_price, limit=PREVIEW_LIMIT):
-    watch = {
-        "brand": brand, "model": model,
-        "year_from": year_from, "year_to": year_to, "max_price": max_price,
-    }
-    lines = []
-    total = 0
+def send_preview(context, chat_id, watch):
+    """Мгновенный просмотр лотов по критериям (watch — словарь с ключами
+    brand/model/year_from/year_to/max_price и, опционально, доп. полями
+    mileage_from/mileage_to/engine_from/engine_to/grade_from/grade_to/
+    lot_number/vin/free_text) — отдельным сообщением с фото на каждый
+    лот, порциями по BATCH_SIZE (см. enqueue_lots), а не одним слитным
+    текстовым сообщением на все найденные лоты сразу."""
+    try:
+        context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
 
+    items = []
     for lot in aleado.get_lots():
         lbrand = (lot.get("brand") or "").strip()
         if not lbrand:
@@ -462,31 +656,22 @@ def format_preview(brand, model, year_from, year_to, max_price, limit=PREVIEW_LI
         lmodel = lot.get("model") or ""
         year = lot_year(lot)
         price = lot_price_rub(lot)
-        if not matches(watch, lbrand, lmodel, year, price):
+        if not matches(watch, lbrand, lmodel, year, price, lot=lot):
             continue
-        total += 1
-        if len(lines) < limit:
-            lines.append(format_lot_text(lot, lbrand, lmodel, year))
+        items.append({"text": format_lot_text(lot, lbrand, lmodel, year), "photo": lot_photo(lot)})
 
-    if not lines:
+    if not items:
         extra = ""
         if aleado.last_error():
             extra = "\n\n(Похоже, фид aleado сейчас недоступен: {})".format(aleado.last_error())
-        return "Прямо сейчас по этим критериям на аукционах ничего не найдено." + extra
+        context.bot.send_message(
+            chat_id=chat_id,
+            text="Прямо сейчас по этим критериям на аукционах ничего не найдено." + extra,
+        )
+        return
 
-    header = "Сейчас подходит лотов: {}\n\n".format(total)
-    body = "\n\n".join(lines)
-    footer = "" if total <= len(lines) else "\n\n…и ещё {}, показаны первые {}.".format(total - len(lines), len(lines))
-    return header + body + footer
-
-
-def send_preview(context, chat_id, brand, model, year_from, year_to, max_price):
-    try:
-        context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    except Exception:
-        pass
-    text = format_preview(brand, model, year_from, year_to, max_price)
-    context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=False)
+    context.bot.send_message(chat_id=chat_id, text="Сейчас подходит лотов: {}".format(len(items)))
+    enqueue_lots(context.bot, chat_id, items)
 
 
 # --------------------------------------------------------------------------
@@ -574,6 +759,57 @@ def price_kb():
     rows.append([InlineKeyboardButton("Без ограничения", callback_data="price:none")])
     rows.append([InlineKeyboardButton("Ввести вручную", callback_data="price:text")])
     rows.append([InlineKeyboardButton("✖ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+# Доп. фильтры — как на форме поиска jmmoto.ru (пробег/объём
+# двигателя/оценка состояния/номер лота/VIN/свободный текст). Шаг
+# необязательный: после выбора цены можно сразу нажать "Готово, к
+# сохранению" в adv_menu_kb() и пропустить всё это.
+MILEAGE_VALUES = [5000, 10000, 20000, 30000, 50000, 80000, 120000, 200000]
+ENGINE_VALUES = [125, 250, 400, 600, 750, 900, 1000, 1300]
+GRADE_VALUES = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+
+
+def range_kb(prefix, values, suffix=""):
+    rows = []
+    row = []
+    for v in values:
+        row.append(InlineKeyboardButton("{}{}".format(v, suffix), callback_data="{}:{}".format(prefix, v)))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Без ограничения", callback_data="{}:none".format(prefix))])
+    rows.append([InlineKeyboardButton("Ввести вручную", callback_data="{}:text".format(prefix))])
+    rows.append([InlineKeyboardButton("‹ Назад к доп. фильтрам", callback_data="adv:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def adv_menu_kb(draft):
+    def mark(is_set):
+        return "✅ " if is_set else ""
+
+    rows = [
+        [InlineKeyboardButton(
+            "{}Пробег, км".format(mark(draft.get("mileage_from") or draft.get("mileage_to"))),
+            callback_data="adv:mileage",
+        )],
+        [InlineKeyboardButton(
+            "{}Объём двигателя, см³".format(mark(draft.get("engine_from") or draft.get("engine_to"))),
+            callback_data="adv:engine",
+        )],
+        [InlineKeyboardButton(
+            "{}Оценка состояния".format(mark(draft.get("grade_from") is not None or draft.get("grade_to") is not None)),
+            callback_data="adv:grade",
+        )],
+        [InlineKeyboardButton("{}Номер лота".format(mark(draft.get("lot_number"))), callback_data="adv:lot")],
+        [InlineKeyboardButton("{}VIN / номер рамы".format(mark(draft.get("vin"))), callback_data="adv:vin")],
+        [InlineKeyboardButton("{}Свободный поиск (текст)".format(mark(draft.get("free_text"))), callback_data="adv:text")],
+        [InlineKeyboardButton("✅ Готово, к сохранению", callback_data="adv:done")],
+        [InlineKeyboardButton("✖ Отмена", callback_data="cancel")],
+    ]
     return InlineKeyboardMarkup(rows)
 
 
@@ -670,13 +906,32 @@ def on_callback(update: Update, context: CallbackContext):
             query.edit_message_text("Не найдено (возможно, уже удалено).")
         return
 
+    if data == "morelots":
+        try:
+            query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        send_lots_batch(context.bot, chat_id)
+        return
+
+    if data == "stoplots":
+        PENDING_LOTS.pop(chat_id, None)
+        try:
+            query.edit_message_text(
+                "Показ остановлен. Оставшиеся лоты уже отмечены как показанные и "
+                "повторно не придут — при следующей проверке пришлём только новые."
+            )
+        except Exception:
+            pass
+        return
+
     if data.startswith("checknow:"):
         wid = int(data.split(":", 1)[1])
         w = db.get_watch(wid, chat_id)
         if not w:
             context.bot.send_message(chat_id, "Фильтр не найден (возможно, уже удалён).")
             return
-        send_preview(context, chat_id, w["brand"], w.get("model"), w.get("year_from"), w.get("year_to"), w.get("max_price"))
+        send_preview(context, chat_id, w)
         return
 
     if data.startswith("brand:"):
@@ -753,7 +1008,118 @@ def on_callback(update: Update, context: CallbackContext):
             query.edit_message_text("Введите максимальную цену в рублях текстом (например, 500000):")
             return
         draft["max_price"] = None if val == "none" else float(val)
+        query.edit_message_text(
+            "Готово. Можно ещё уточнить (необязательно) — как на jmmoto.ru: пробег, "
+            "объём двигателя, оценку состояния, номер лота, VIN, свободный текст.\n"
+            "Или сразу «Готово, к сохранению».",
+            reply_markup=adv_menu_kb(draft),
+        )
+        return
+
+    if data == "adv:menu":
+        draft = DRAFTS.setdefault(chat_id, {})
+        query.edit_message_text("Доп. фильтры (необязательно):", reply_markup=adv_menu_kb(draft))
+        return
+
+    if data == "adv:mileage":
+        query.edit_message_text("Пробег от, км:", reply_markup=range_kb("mf", MILEAGE_VALUES, " км"))
+        return
+
+    if data == "adv:engine":
+        query.edit_message_text("Объём двигателя от, см³:", reply_markup=range_kb("ef", ENGINE_VALUES, " см³"))
+        return
+
+    if data == "adv:grade":
+        query.edit_message_text("Оценка состояния от:", reply_markup=range_kb("gf", GRADE_VALUES))
+        return
+
+    if data == "adv:lot":
+        draft = DRAFTS.setdefault(chat_id, {})
+        draft["awaiting"] = "lot_text"
+        query.edit_message_text("Введите номер лота текстом:")
+        return
+
+    if data == "adv:vin":
+        draft = DRAFTS.setdefault(chat_id, {})
+        draft["awaiting"] = "vin_text"
+        query.edit_message_text("Введите VIN / номер рамы текстом (можно частично):")
+        return
+
+    if data == "adv:text":
+        draft = DRAFTS.setdefault(chat_id, {})
+        draft["awaiting"] = "freetext_text"
+        query.edit_message_text("Введите слово/фразу для свободного поиска по описанию лота:")
+        return
+
+    if data == "adv:done":
+        draft = DRAFTS.get(chat_id, {})
         show_confirm(query, draft)
+        return
+
+    if data.startswith("mf:"):
+        val = data.split(":", 1)[1]
+        draft = DRAFTS.setdefault(chat_id, {})
+        if val == "text":
+            draft["awaiting"] = "mf_text"
+            query.edit_message_text("Введите пробег «от» числом, км:")
+            return
+        draft["mileage_from"] = None if val == "none" else int(val)
+        query.edit_message_text("Пробег до, км:", reply_markup=range_kb("mt", MILEAGE_VALUES, " км"))
+        return
+
+    if data.startswith("mt:"):
+        val = data.split(":", 1)[1]
+        draft = DRAFTS.setdefault(chat_id, {})
+        if val == "text":
+            draft["awaiting"] = "mt_text"
+            query.edit_message_text("Введите пробег «до» числом, км:")
+            return
+        draft["mileage_to"] = None if val == "none" else int(val)
+        query.edit_message_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
+        return
+
+    if data.startswith("ef:"):
+        val = data.split(":", 1)[1]
+        draft = DRAFTS.setdefault(chat_id, {})
+        if val == "text":
+            draft["awaiting"] = "ef_text"
+            query.edit_message_text("Введите объём двигателя «от» числом, см³:")
+            return
+        draft["engine_from"] = None if val == "none" else int(val)
+        query.edit_message_text("Объём двигателя до, см³:", reply_markup=range_kb("et", ENGINE_VALUES, " см³"))
+        return
+
+    if data.startswith("et:"):
+        val = data.split(":", 1)[1]
+        draft = DRAFTS.setdefault(chat_id, {})
+        if val == "text":
+            draft["awaiting"] = "et_text"
+            query.edit_message_text("Введите объём двигателя «до» числом, см³:")
+            return
+        draft["engine_to"] = None if val == "none" else int(val)
+        query.edit_message_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
+        return
+
+    if data.startswith("gf:"):
+        val = data.split(":", 1)[1]
+        draft = DRAFTS.setdefault(chat_id, {})
+        if val == "text":
+            draft["awaiting"] = "gf_text"
+            query.edit_message_text("Введите оценку «от» числом (0–9):")
+            return
+        draft["grade_from"] = None if val == "none" else float(val)
+        query.edit_message_text("Оценка состояния до:", reply_markup=range_kb("gt", GRADE_VALUES))
+        return
+
+    if data.startswith("gt:"):
+        val = data.split(":", 1)[1]
+        draft = DRAFTS.setdefault(chat_id, {})
+        if val == "text":
+            draft["awaiting"] = "gt_text"
+            query.edit_message_text("Введите оценку «до» числом (0–9):")
+            return
+        draft["grade_to"] = None if val == "none" else float(val)
+        query.edit_message_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
         return
 
     if data == "confirm:save":
@@ -763,11 +1129,7 @@ def on_callback(update: Update, context: CallbackContext):
 
     if data == "confirm:preview":
         draft = DRAFTS.get(chat_id, {})
-        send_preview(
-            context, chat_id,
-            draft.get("brand", "?"), draft.get("model"),
-            draft.get("year_from"), draft.get("year_to"), draft.get("max_price"),
-        )
+        send_preview(context, chat_id, draft)
         return
 
 
@@ -775,6 +1137,7 @@ def show_confirm(query, draft):
     summary = describe_criteria(
         draft.get("brand", "?"), draft.get("model"),
         draft.get("year_from"), draft.get("year_to"), draft.get("max_price"),
+        extra=describe_extra(draft),
     )
     query.edit_message_text("Фильтр готов:\n{}\n\nЧто дальше?".format(summary), reply_markup=confirm_kb())
 
@@ -785,11 +1148,17 @@ def finalize_watch(query, context, chat_id, draft):
     year_from = draft.get("year_from")
     year_to = draft.get("year_to")
     max_price = draft.get("max_price")
-    watch_id = db.add_watch(chat_id, brand, model, year_from, year_to, max_price)
-    w = {
-        "id": watch_id, "chat_id": chat_id, "brand": brand, "model": model,
-        "year_from": year_from, "year_to": year_to, "max_price": max_price,
-    }
+    watch_id = db.add_watch(
+        chat_id, brand, model, year_from, year_to, max_price,
+        mileage_from=draft.get("mileage_from"), mileage_to=draft.get("mileage_to"),
+        engine_from=draft.get("engine_from"), engine_to=draft.get("engine_to"),
+        grade_from=draft.get("grade_from"), grade_to=draft.get("grade_to"),
+        lot_number=draft.get("lot_number"), vin=draft.get("vin"), free_text=draft.get("free_text"),
+    )
+    w = dict(draft)
+    w["id"] = watch_id
+    w["chat_id"] = chat_id
+    w["brand"] = brand
     DRAFTS.pop(chat_id, None)
     query.edit_message_text("✅ Фильтр сохранён:\n{}".format(describe_watch(w)))
     context.bot.send_message(chat_id, "Готово. Ждите уведомлений о новых лотах.", reply_markup=main_menu_kb())
@@ -858,13 +1227,90 @@ def on_text(update: Update, context: CallbackContext):
             return
         draft["max_price"] = price
         draft.pop("awaiting", None)
-        summary = describe_criteria(
-            draft.get("brand", "?"), draft.get("model"),
-            draft.get("year_from"), draft.get("year_to"), draft.get("max_price"),
-        )
         update.effective_message.reply_text(
-            "Фильтр готов:\n{}\n\nЧто дальше?".format(summary), reply_markup=confirm_kb()
+            "Готово. Можно ещё уточнить (необязательно) — как на jmmoto.ru: пробег, "
+            "объём двигателя, оценку состояния, номер лота, VIN, свободный текст.\n"
+            "Или сразу «Готово, к сохранению».",
+            reply_markup=adv_menu_kb(draft),
         )
+        return
+
+    if awaiting == "lot_text":
+        draft["lot_number"] = text or None
+        draft.pop("awaiting", None)
+        update.effective_message.reply_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
+        return
+
+    if awaiting == "vin_text":
+        draft["vin"] = text or None
+        draft.pop("awaiting", None)
+        update.effective_message.reply_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
+        return
+
+    if awaiting == "freetext_text":
+        draft["free_text"] = text or None
+        draft.pop("awaiting", None)
+        update.effective_message.reply_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
+        return
+
+    if awaiting == "mf_text":
+        val = parse_price(text)
+        if val is None:
+            update.effective_message.reply_text("Не понял пробег. Напишите числом, км:")
+            return
+        draft["mileage_from"] = int(val)
+        draft.pop("awaiting", None)
+        update.effective_message.reply_text("Пробег до, км:", reply_markup=range_kb("mt", MILEAGE_VALUES, " км"))
+        return
+
+    if awaiting == "mt_text":
+        val = parse_price(text)
+        if val is None:
+            update.effective_message.reply_text("Не понял пробег. Напишите числом, км:")
+            return
+        draft["mileage_to"] = int(val)
+        draft.pop("awaiting", None)
+        update.effective_message.reply_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
+        return
+
+    if awaiting == "ef_text":
+        val = parse_price(text)
+        if val is None:
+            update.effective_message.reply_text("Не понял объём. Напишите числом, см³:")
+            return
+        draft["engine_from"] = int(val)
+        draft.pop("awaiting", None)
+        update.effective_message.reply_text("Объём двигателя до, см³:", reply_markup=range_kb("et", ENGINE_VALUES, " см³"))
+        return
+
+    if awaiting == "et_text":
+        val = parse_price(text)
+        if val is None:
+            update.effective_message.reply_text("Не понял объём. Напишите числом, см³:")
+            return
+        draft["engine_to"] = int(val)
+        draft.pop("awaiting", None)
+        update.effective_message.reply_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
+        return
+
+    if awaiting == "gf_text":
+        val = parse_price(text)
+        if val is None:
+            update.effective_message.reply_text("Не понял оценку. Напишите числом, 0–9:")
+            return
+        draft["grade_from"] = val
+        draft.pop("awaiting", None)
+        update.effective_message.reply_text("Оценка состояния до:", reply_markup=range_kb("gt", GRADE_VALUES))
+        return
+
+    if awaiting == "gt_text":
+        val = parse_price(text)
+        if val is None:
+            update.effective_message.reply_text("Не понял оценку. Напишите числом, 0–9:")
+            return
+        draft["grade_to"] = val
+        draft.pop("awaiting", None)
+        update.effective_message.reply_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
         return
 
 

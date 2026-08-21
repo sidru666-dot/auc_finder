@@ -38,6 +38,24 @@ MYSQL_DB = os.environ.get("MYSQL_DB") or os.environ.get("MYSQLDATABASE", "aleado
 _schema_lock = threading.Lock()
 _schema_ready = False
 
+# Доп. поля фильтра (аналог полей формы поиска на jmmoto.ru — пробег,
+# объём двигателя, оценка состояния, номер лота, VIN, свободный текст).
+# Добавляются через ALTER TABLE к уже существующей bot_watches (см.
+# _migrate_watch_columns), а не только в CREATE TABLE — иначе на уже
+# развёрнутой базе (где таблица создана раньше, без этих колонок) бот
+# упал бы при первом же INSERT с "Unknown column".
+_WATCH_EXTRA_COLUMNS = {
+    "mileage_from": "INT NULL",
+    "mileage_to": "INT NULL",
+    "engine_from": "INT NULL",
+    "engine_to": "INT NULL",
+    "grade_from": "DOUBLE NULL",
+    "grade_to": "DOUBLE NULL",
+    "lot_number": "VARCHAR(64) NULL",
+    "vin": "VARCHAR(64) NULL",
+    "free_text": "VARCHAR(191) NULL",
+}
+
 
 def _connect():
     return pymysql.connect(
@@ -89,9 +107,25 @@ def init_schema():
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                     """
                 )
+                _migrate_watch_columns(cur)
         finally:
             conn.close()
         _schema_ready = True
+
+
+def _migrate_watch_columns(cur):
+    """Добавляет в bot_watches колонки из _WATCH_EXTRA_COLUMNS, которых
+    там ещё нет (на новой базе CREATE TABLE их пока не создаёт — проще
+    держать один список и здесь, и добавлять миграцией, чем дублировать
+    его в CREATE TABLE и следить, чтобы они не разошлись)."""
+    cur.execute(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='bot_watches'"
+    )
+    existing = {row["COLUMN_NAME"] for row in cur.fetchall()}
+    for col, ddl in _WATCH_EXTRA_COLUMNS.items():
+        if col not in existing:
+            cur.execute("ALTER TABLE bot_watches ADD COLUMN `{}` {}".format(col, ddl))
 
 
 # --------------------------------------------------------------------------
@@ -127,15 +161,26 @@ def get_watch(watch_id, chat_id):
         conn.close()
 
 
-def add_watch(chat_id, brand, model, year_from, year_to, max_price):
+def add_watch(
+    chat_id, brand, model, year_from, year_to, max_price,
+    mileage_from=None, mileage_to=None, engine_from=None, engine_to=None,
+    grade_from=None, grade_to=None, lot_number=None, vin=None, free_text=None,
+):
     init_schema()
     conn = _connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO bot_watches (chat_id, brand, model, year_from, year_to, max_price) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (chat_id, brand, model, year_from, year_to, max_price),
+                "INSERT INTO bot_watches "
+                "(chat_id, brand, model, year_from, year_to, max_price, "
+                "mileage_from, mileage_to, engine_from, engine_to, "
+                "grade_from, grade_to, lot_number, vin, free_text) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    chat_id, brand, model, year_from, year_to, max_price,
+                    mileage_from, mileage_to, engine_from, engine_to,
+                    grade_from, grade_to, lot_number, vin, free_text,
+                ),
             )
             return cur.lastrowid
     finally:
