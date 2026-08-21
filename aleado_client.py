@@ -331,6 +331,20 @@ def _mysql_defaults_file(ssl_line=""):
     return path
 
 
+# Жёсткий потолок на импорт дампа через клиент mysql (subprocess). Без
+# этого таймаута зависший клиент (например, ждёт metadata lock на
+# таблице от чужого/старого соединения — такое бывает буквально в
+# несколько секунд перехлёста при редеплое, когда старый контейнер ещё
+# не до конца отключился от MySQL) блокировал бы _do_refresh() НАВСЕГДА,
+# а вместе с ним — весь бот (см. комментарий у _state_lock: пока
+# ensure_fresh() держит lock, ЛЮБОЙ клик в Telegram, которому нужны
+# данные фида, тоже виснет навечно). Лучше через несколько минут явно
+# провалить это обновление (bot.get_lots() и т.п. просто отдадут
+# последний удачный кэш) и попробовать снова на следующем цикле, чем
+# подвесить бота целиком без возможности восстановиться самому.
+MYSQL_IMPORT_TIMEOUT_SECONDS = 240
+
+
 def _run_mysql(sql_text=None, sql_file=None, database=None, defaults_file=None):
     cmd = ["mysql", "--defaults-extra-file=" + defaults_file]
     if database:
@@ -343,9 +357,19 @@ def _run_mysql(sql_text=None, sql_file=None, database=None, defaults_file=None):
         stdin_data = (sql_text or "").encode("utf-8")
 
     proc = subprocess.Popen(cmd, stdin=cmd_stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate(input=stdin_data)
-    if sql_file:
-        cmd_stdin.close()
+    try:
+        out, err = proc.communicate(input=stdin_data, timeout=MYSQL_IMPORT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise RuntimeError(
+            "mysql не ответил за {} сек. (похоже, завис на блокировке таблицы) — прервано".format(
+                MYSQL_IMPORT_TIMEOUT_SECONDS
+            )
+        )
+    finally:
+        if sql_file:
+            cmd_stdin.close()
     if proc.returncode != 0:
         raise RuntimeError("mysql завершился с ошибкой: {}".format(err.decode("utf-8", "replace")))
     return out.decode("utf-8", "replace")
@@ -560,16 +584,28 @@ def _do_refresh():
             for brand_lower, counts in brand_model_counts.items()
         }
 
-        with _state_lock:
-            _cache["tables"] = new_tables
-            _cache["lots"] = all_lots
-            _cache["brand_models"] = brand_models
-            _cache["ts"] = time.time()
-            _cache["error"] = None
+        # ВАЖНО: _do_refresh() всегда вызывается из ensure_fresh() уже
+        # ВНУТРИ "with _state_lock:" (см. ниже) — тот же самый поток тут
+        # повторно брать _state_lock НЕ должен. threading.Lock() не
+        # реентрантный: повторный "with _state_lock:" тем же потоком —
+        # это не "подождать своей же очереди", а самозаклинивание навечно
+        # (поток ждёт снятия блокировки, которую сам же держит и снять не
+        # может, пока не выйдет из этого with — а выйти не может, пока не
+        # дождётся). Именно это и произошло в проде: лог "таблица ...
+        # строк" успевал напечататься (он ДО этого места), а дальше поток
+        # зависал тут насмерть — _cache["ts"] так и не проставлялся,
+        # ensure_fresh() у всех остальных (в т.ч. по клику "Марка: ...")
+        # висел бы вечно в очереди на тот же lock. Раньше здесь стоял
+        # "with _state_lock:" — это и была причина зависаний "Ищу
+        # модели..." на много минут. Пишем в кэш без повторного захвата.
+        _cache["tables"] = new_tables
+        _cache["lots"] = all_lots
+        _cache["brand_models"] = brand_models
+        _cache["ts"] = time.time()
+        _cache["error"] = None
     except Exception as e:
         log.exception("aleado: обновление фида не удалось")
-        with _state_lock:
-            _cache["error"] = str(e)
+        _cache["error"] = str(e)
         raise
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
