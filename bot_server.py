@@ -110,8 +110,11 @@ CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "300"))
 # а не высыпаем все найденные лоты одним потоком сообщений подряд.
 BATCH_SIZE = 10
 
-# Сколько разных моделей показывать кнопками под маркой.
-MODEL_BUTTON_LIMIT = 18
+# Сколько разных моделей показывать кнопками под маркой ЗА ОДИН ЭКРАН —
+# раньше это был жёсткий потолок (модели после 18-й вообще не попадали
+# в кнопки, даже прокруткой), теперь это размер одной страницы, а весь
+# список моделей марки листается кнопками "Ещё"/"Назад" (см. model_kb).
+MODEL_PAGE_SIZE = 16
 
 # --------------------------------------------------------------------------
 # Курс йена -> рубль (актуальный, по данным ЦБ РФ)
@@ -447,11 +450,13 @@ def lot_jmmoto_url(lot):
     return JMMOTO_BASE_URL
 
 
-def fetch_model_candidates(brand, limit=MODEL_BUTTON_LIMIT):
+def fetch_model_candidates(brand, limit=None):
     """Реальные названия моделей марки brand, отсортированные по частоте
     встречаемости (самые ходовые — первыми). Берётся из готового индекса
     aleado_client (посчитан один раз при обновлении фида) — без повторного
-    прохода по всем 10+ тысячам лотов на каждое нажатие кнопки марки."""
+    прохода по всем 10+ тысячам лотов на каждое нажатие кнопки марки.
+    Без limit — весь список (листается кнопками в model_kb), а не только
+    первые 18, как было раньше."""
     return aleado.get_brand_models(brand, limit=limit)
 
 
@@ -723,10 +728,22 @@ def brand_kb():
     return InlineKeyboardMarkup(rows)
 
 
-def model_kb(candidates):
+def model_kb(candidates, page=0):
+    """Кнопки моделей ОДНОЙ страницей (MODEL_PAGE_SIZE штук), плюс
+    навигация "Ещё"/"Назад", если моделей у марки больше, чем влезает на
+    экран — раньше показывались только первые MODEL_BUTTON_LIMIT (18) и
+    остальные были вообще недоступны кнопкой, что и было жалобой: "тут
+    явно не все модели". callback_data кнопки модели несёт АБСОЛЮТНЫЙ
+    индекс в полном списке candidates (не индекс на странице) — так
+    modelidx: в on_callback остаётся рабочим без изменений."""
+    total = len(candidates)
+    start = page * MODEL_PAGE_SIZE
+    end = start + MODEL_PAGE_SIZE
+    page_items = list(enumerate(candidates))[start:end]
+
     rows = []
     row = []
-    for i, m in enumerate(candidates):
+    for i, m in page_items:
         label = m if len(m) <= 26 else m[:23] + "…"
         row.append(InlineKeyboardButton(label, callback_data="modelidx:{}".format(i)))
         if len(row) == 2:
@@ -734,6 +751,18 @@ def model_kb(candidates):
             row = []
     if row:
         rows.append(row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Назад", callback_data="modelpage:{}".format(page - 1)))
+    if end < total:
+        nav.append(InlineKeyboardButton(
+            "▶️ Ещё модели ({}/{})".format(min(end, total), total),
+            callback_data="modelpage:{}".format(page + 1),
+        ))
+    if nav:
+        rows.append(nav)
+
     rows.append([InlineKeyboardButton("Любая модель", callback_data="model:any")])
     rows.append([InlineKeyboardButton("Указать модель (ввести текст)", callback_data="model:text")])
     rows.append([InlineKeyboardButton("✖ Отмена", callback_data="cancel")])
@@ -993,6 +1022,16 @@ def on_callback(update: Update, context: CallbackContext):
                 "подсказать модели — выберите «Любая модель» или введите вручную:"
             ).format(brand)
         context.bot.send_message(chat_id, note, reply_markup=model_kb(candidates))
+        return
+
+    if data.startswith("modelpage:"):
+        page = int(data.split(":", 1)[1])
+        draft = DRAFTS.setdefault(chat_id, {})
+        candidates = draft.get("model_candidates", [])
+        try:
+            query.edit_message_reply_markup(reply_markup=model_kb(candidates, page=page))
+        except Exception:
+            pass
         return
 
     if data.startswith("modelidx:"):
