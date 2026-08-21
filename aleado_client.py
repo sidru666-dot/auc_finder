@@ -263,17 +263,33 @@ def extract_bz2(bz2_path):
 # --------------------------------------------------------------------------
 
 
-def _mysql_defaults_file():
-    """Временный --defaults-extra-file с паролем, чтобы не светить пароль
-    в списке процессов (ps aux) и не спрашивать его интерактивно.
+# MySQL-плагин на Railway отдаёт самоподписанный сертификат, а клиент
+# `mysql` (в отличие от PyMySQL, который по умолчанию SSL не требует)
+# по умолчанию пытается его проверить и падает с "TLS/SSL error:
+# self-signed certificate in certificate chain". Соединение и так идёт
+# по приватной сети внутри одного проекта Railway (MYSQL_HOST=
+# *.railway.internal, наружу не торчит), так что отключать проверку
+# сертификата тут безопасно — но конкретное имя опции для этого
+# отличается между MySQL-клиентом и разными версиями MariaDB-клиента
+# (какой именно окажется в образе — заранее не известно, `default-
+# mysql-client` в apt на разных дистрибутивах резолвится по-разному), и
+# неверное имя опции — это фатальная ошибка запуска ("unknown
+# variable"), а не мягкое предупреждение. Поэтому пробуем по очереди
+# несколько вариантов и останавливаемся на первом, который клиент
+# принял (после этого либо соединение уже сработало, либо упало по
+# другой причине, не связанной с именем опции — тогда дальше пробовать
+# бессмысленно).
+_SSL_DISABLE_VARIANTS = (
+    "ssl-mode=DISABLED",       # MySQL 8.x клиент, MariaDB-клиент 10.4+
+    "ssl=0",                   # старый универсальный булевский флаг
+    "ssl-verify-server-cert=0",  # старый MariaDB-клиент без ssl-mode
+    "",                        # совсем без опции — как было изначально
+)
 
-    ssl-mode=DISABLED — потому что MySQL-плагин на Railway отдаёт
-    самоподписанный сертификат, а клиент `mysql` (в отличие от PyMySQL,
-    который по умолчанию SSL не требует) по умолчанию пытается его
-    проверить и падает с "TLS/SSL error: self-signed certificate in
-    certificate chain". Соединение и так идёт по приватной сети внутри
-    одного проекта Railway (MYSQL_HOST=*.railway.internal, наружу не
-    торчит), так что отключать проверку сертификата здесь безопасно."""
+
+def _mysql_defaults_file(ssl_line=""):
+    """Временный --defaults-extra-file с паролем, чтобы не светить пароль
+    в списке процессов (ps aux) и не спрашивать его интерактивно."""
     fd, path = tempfile.mkstemp(prefix="aleado_mysql_", suffix=".cnf")
     with os.fdopen(fd, "w") as f:
         f.write("[client]\n")
@@ -281,7 +297,8 @@ def _mysql_defaults_file():
         f.write("port={}\n".format(MYSQL_PORT))
         f.write("user={}\n".format(MYSQL_USER))
         f.write("password={}\n".format(MYSQL_PASSWORD))
-        f.write("ssl-mode=DISABLED\n")
+        if ssl_line:
+            f.write(ssl_line + "\n")
     os.chmod(path, 0o600)
     return path
 
@@ -306,20 +323,50 @@ def _run_mysql(sql_text=None, sql_file=None, database=None, defaults_file=None):
     return out.decode("utf-8", "replace")
 
 
+# Кэш подобранного варианта на процесс, чтобы не перебирать заново на
+# каждое обновление фида — как только один вариант сработал (или мы
+# перебрали все и остался последний), используем его дальше.
+_ssl_variant_cache = {"value": None}
+
+
+def _run_mysql_ssl_aware(**kwargs):
+    """То же самое, что и последовательность _mysql_defaults_file +
+    _run_mysql, но с перебором _SSL_DISABLE_VARIANTS при ошибке вида
+    "unknown variable" (клиент не знает такое имя опции — пробуем
+    следующий вариант). Любая другая ошибка (неверный пароль, нет сети
+    и т.п.) сразу пробрасывается дальше, перебор не имеет смысла."""
+    variants = (
+        [_ssl_variant_cache["value"]]
+        if _ssl_variant_cache["value"] is not None
+        else list(_SSL_DISABLE_VARIANTS)
+    )
+    last_exc = None
+    for i, ssl_line in enumerate(variants):
+        defaults_file = _mysql_defaults_file(ssl_line)
+        try:
+            result = _run_mysql(defaults_file=defaults_file, **kwargs)
+            _ssl_variant_cache["value"] = ssl_line
+            return result
+        except RuntimeError as e:
+            last_exc = e
+            is_last = i == len(variants) - 1
+            if "unknown variable" in str(e).lower() and not is_last:
+                continue
+            raise
+        finally:
+            os.unlink(defaults_file)
+    raise last_exc
+
+
 def import_dump(sql_path):
     """Создаёт базу MYSQL_DB (если её нет) и импортирует туда дамп.
     Дампы mysqldump обычно сами делают DROP TABLE IF EXISTS + CREATE
     TABLE, так что повторный импорт при каждом обновлении — это просто
     полная замена данных на свежие, а не накопление дублей."""
-    defaults_file = _mysql_defaults_file()
-    try:
-        _run_mysql(
-            sql_text="CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4;".format(MYSQL_DB),
-            defaults_file=defaults_file,
-        )
-        _run_mysql(sql_file=sql_path, database=MYSQL_DB, defaults_file=defaults_file)
-    finally:
-        os.unlink(defaults_file)
+    _run_mysql_ssl_aware(
+        sql_text="CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4;".format(MYSQL_DB),
+    )
+    _run_mysql_ssl_aware(sql_file=sql_path, database=MYSQL_DB)
 
 
 # --------------------------------------------------------------------------
