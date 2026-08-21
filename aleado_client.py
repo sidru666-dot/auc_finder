@@ -265,7 +265,15 @@ def extract_bz2(bz2_path):
 
 def _mysql_defaults_file():
     """Временный --defaults-extra-file с паролем, чтобы не светить пароль
-    в списке процессов (ps aux) и не спрашивать его интерактивно."""
+    в списке процессов (ps aux) и не спрашивать его интерактивно.
+
+    ssl-mode=DISABLED — потому что MySQL-плагин на Railway отдаёт
+    самоподписанный сертификат, а клиент `mysql` (в отличие от PyMySQL,
+    который по умолчанию SSL не требует) по умолчанию пытается его
+    проверить и падает с "TLS/SSL error: self-signed certificate in
+    certificate chain". Соединение и так идёт по приватной сети внутри
+    одного проекта Railway (MYSQL_HOST=*.railway.internal, наружу не
+    торчит), так что отключать проверку сертификата здесь безопасно."""
     fd, path = tempfile.mkstemp(prefix="aleado_mysql_", suffix=".cnf")
     with os.fdopen(fd, "w") as f:
         f.write("[client]\n")
@@ -273,6 +281,7 @@ def _mysql_defaults_file():
         f.write("port={}\n".format(MYSQL_PORT))
         f.write("user={}\n".format(MYSQL_USER))
         f.write("password={}\n".format(MYSQL_PASSWORD))
+        f.write("ssl-mode=DISABLED\n")
     os.chmod(path, 0o600)
     return path
 
