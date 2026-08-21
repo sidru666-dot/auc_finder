@@ -165,11 +165,16 @@ HELP_TEXT = (
     "Я слежу за мотолотами на японских аукционах (данные — платный фид "
     "aleado) и присылаю новые лоты по вашим фильтрам, с фото и оценкой "
     "состояния, если они есть в данных лота.\n\n"
-    "Команды:\n"
-    "/start или /help — это сообщение и меню\n"
-    "/watch — добавить фильтр (марка/модель/годы/цена кнопками)\n"
-    "/mywatches — список своих фильтров: можно мгновенно проверить или удалить\n"
-    "/cancel — отменить текущую настройку фильтра\n\n"
+    "Всё управление — кнопками, ничего печатать не нужно (кроме случаев, "
+    "когда сами захотите ввести марку/модель/цифру вручную):\n"
+    "🏍 «Аукционы онлайн» — задать марку/модель/годы/цену и другие "
+    "фильтры кнопками, как на сайте, и сразу посмотреть, что подходит\n"
+    "📊 «Статистика» — история проданных лотов (пока недоступна, см. "
+    "пояснение в самой кнопке)\n"
+    "🔔 «Мои оповещения» — список сохранённых фильтров: можно мгновенно "
+    "проверить или удалить\n\n"
+    "Команды остаются для тех, кому так привычнее: /watch (то же самое, "
+    "что «Аукционы онлайн»), /mywatches, /cancel.\n\n"
     "Модели в кнопках — реальные названия из текущих лотов, поэтому не "
     "нужно гадать написание. Годы и цену можно как выбрать кнопкой, так "
     "и напечатать вручную. В конце настройки фильтра можно сразу "
@@ -591,11 +596,17 @@ def enqueue_lots(bot, chat_id, items):
 
 
 def check_all(bot):
+    # Сначала обновляем/греем кэш фида в любом случае (даже если сейчас
+    # ни у кого нет фильтров) — иначе кэш никогда не обновлялся бы
+    # фоново без подписок, и первый же пользователь, нажавший кнопку,
+    # сам того не зная, попадал бы на холодное обновление (скачивание +
+    # импорт дампа) прямо во время нажатия кнопки, и ждал бы результата.
+    lots = aleado.get_lots()
+
     watches = db.list_watches()
     if not watches:
         return
 
-    lots = aleado.get_lots()
     if not lots:
         if aleado.last_error():
             log.warning("aleado: фид сейчас недоступен (%s), пропускаю проверку", aleado.last_error())
@@ -691,9 +702,12 @@ def send_preview(context, chat_id, watch):
 
 
 def main_menu_kb():
+    """Главное меню — как на сайте: сразу выбор режима (Аукционы
+    онлайн / Статистика), а не команда текстом."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Добавить фильтр", callback_data="menu:new")],
-        [InlineKeyboardButton("📋 Мои фильтры", callback_data="menu:list")],
+        [InlineKeyboardButton("🏍 Аукционы онлайн", callback_data="menu:new")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="menu:stats")],
+        [InlineKeyboardButton("🔔 Мои оповещения", callback_data="menu:list")],
     ])
 
 
@@ -867,7 +881,9 @@ def mywatches_cmd(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     text, kb = mywatches_view(chat_id)
     if not kb:
-        update.effective_message.reply_text("У вас пока нет фильтров. Нажмите /watch, чтобы добавить.")
+        update.effective_message.reply_text(
+            "У вас пока нет сохранённых оповещений.", reply_markup=main_menu_kb()
+        )
         return
     update.effective_message.reply_text(text, reply_markup=kb)
 
@@ -900,10 +916,21 @@ def on_callback(update: Update, context: CallbackContext):
         query.edit_message_text("Выберите марку:", reply_markup=brand_kb())
         return
 
+    if data == "menu:stats":
+        query.edit_message_text(
+            "«Статистика» (история проданных лотов, как на jmmoto.ru) пока "
+            "недоступна: для неё нужен отдельный раздел фида aleado с уже "
+            "прошедшими торгами, а сейчас подключены только текущие/будущие "
+            "лоты («Аукционы онлайн»). Как только появится доступ к данным "
+            "по статистике — добавлю этот раздел и сюда.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
     if data == "menu:list":
         text, kb = mywatches_view(chat_id)
         if not kb:
-            query.edit_message_text("У вас пока нет фильтров. Нажмите /watch, чтобы добавить.")
+            query.edit_message_text("У вас пока нет сохранённых оповещений.", reply_markup=main_menu_kb())
         else:
             query.edit_message_text(text, reply_markup=kb)
         return
@@ -954,7 +981,11 @@ def on_callback(update: Update, context: CallbackContext):
             return
         draft["brand"] = brand
         draft.pop("awaiting", None)
-        query.edit_message_text("Марка: {}\nИщу модели в данных аукционов…".format(brand))
+        query.edit_message_text(
+            "Марка: {}\nИщу модели в данных аукционов… (обычно доля секунды; "
+            "если бот только что перезапускался — может занять до пары минут "
+            "на первый раз, дальше будет быстро)".format(brand)
+        )
         candidates = fetch_model_candidates(brand)
         draft["model_candidates"] = candidates
         if candidates:
@@ -1336,6 +1367,15 @@ def main():
     # кнопки пользователем.
     db.init_schema()
     log.info("Схема БД готова (MYSQL_HOST=%s MYSQL_DB=%s).", db.MYSQL_HOST, db.MYSQL_DB)
+
+    # Греем кэш фида aleado сразу при старте, в фоновом потоке, не
+    # дожидаясь ни первого срабатывания check_job (через 10 сек), ни уж
+    # тем более первого нажатия кнопки пользователем — если бот только
+    # что перезапущен и кэш пуст, самое первое скачивание+импорт дампа
+    # может занять до пары минут, и лучше, чтобы это ожидание не
+    # выпадало на живого пользователя, который в этот момент выбирает
+    # марку в /watch.
+    threading.Thread(target=aleado.ensure_fresh, name="aleado-warmup", daemon=True).start()
 
     updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
