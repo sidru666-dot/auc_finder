@@ -166,6 +166,8 @@ _state_lock = threading.Lock()
 _cache = {
     "ts": 0.0,
     "tables": {},   # table_name -> {"columns": [...], "resolved": {...}, "rows": [dict,...]}
+    "lots": [],     # готовые словари лотов (канонические поля), посчитано один раз за обновление
+    "brand_models": {},  # brand.lower() -> [model, ...] отсортировано по частоте, посчитано один раз за обновление
     "error": None,
 }
 
@@ -483,6 +485,14 @@ def _refresh_is_fresh():
     return _cache["ts"] and (time.time() - _cache["ts"]) < REFRESH_TTL_SECONDS
 
 
+def _build_lot(table, resolved, extra_grade_cols, raw):
+    lot = {"_table": table, "_raw": raw}
+    for canon, col in resolved.items():
+        lot[canon] = raw.get(col) if col else None
+    lot["_extra_grades"] = {col: raw.get(col) for col in extra_grade_cols if raw.get(col)}
+    return lot
+
+
 def _do_refresh():
     tmp_dir = tempfile.mkdtemp(prefix="aleado_dump_")
     try:
@@ -519,8 +529,41 @@ def _do_refresh():
                 if rows:
                     log.info("aleado: таблица %s — первая строка: %s", table, rows[0])
 
+        # Разбираем "сырые" строки в канонические словари лотов И считаем
+        # индекс марка -> модели ОДИН РАЗ здесь, при обновлении фида — а
+        # не при каждом обращении пользователя. Раньше get_lots()
+        # пересобирал все 14000+ строк заново на КАЖДЫЙ вызов (а его
+        # вызывает и /watch при выборе марки, и фоновая проверка, и
+        # предпросмотр), и то же самое отдельно повторял
+        # fetch_model_candidates() в bot_server.py, чтобы выбрать модели
+        # под марку — то есть один клик по кнопке марки мог означать
+        # двойной проход по всем строкам. Теперь и список лотов, и
+        # готовый индекс по маркам считаются один раз за обновление и
+        # переиспользуются без пересчёта.
+        all_lots = []
+        brand_model_counts = {}  # brand_lower -> {model_name: count}
+        for table, info in new_tables.items():
+            resolved = info["resolved"]
+            extra_grade_cols = info["extra_grades"]
+            for raw in info["rows"]:
+                lot = _build_lot(table, resolved, extra_grade_cols, raw)
+                all_lots.append(lot)
+                brand = (lot.get("brand") or "").strip()
+                model = (lot.get("model") or "").strip()
+                if not brand or not model:
+                    continue
+                counts = brand_model_counts.setdefault(brand.lower(), {})
+                counts[model] = counts.get(model, 0) + 1
+
+        brand_models = {
+            brand_lower: sorted(counts.keys(), key=lambda m: (-counts[m], m))
+            for brand_lower, counts in brand_model_counts.items()
+        }
+
         with _state_lock:
             _cache["tables"] = new_tables
+            _cache["lots"] = all_lots
+            _cache["brand_models"] = brand_models
             _cache["ts"] = time.time()
             _cache["error"] = None
     except Exception as e:
@@ -567,21 +610,22 @@ def last_error():
 
 def get_lots(table=None):
     """Список лотов (список словарей с каноническими ключами, см.
-    FIELD_CANDIDATES) из одной или всех настроенных таблиц."""
+    FIELD_CANDIDATES) из одной или всех настроенных таблиц.
+
+    Список уже готов в кэше (посчитан один раз в _do_refresh() при
+    каждом обновлении фида) — здесь только отдаём его, без повторной
+    пересборки на каждый вызов."""
     ensure_fresh()
-    tables = [table] if table else TABLES
-    out = []
-    for t in tables:
-        info = _cache["tables"].get(t)
-        if not info:
-            continue
-        resolved = info["resolved"]
-        for raw in info["rows"]:
-            lot = {"_table": t, "_raw": raw}
-            for canon, col in resolved.items():
-                lot[canon] = raw.get(col) if col else None
-            lot["_extra_grades"] = {
-                col: raw.get(col) for col in info["extra_grades"] if raw.get(col)
-            }
-            out.append(lot)
-    return out
+    if table is None:
+        return _cache["lots"]
+    return [lot for lot in _cache["lots"] if lot.get("_table") == table]
+
+
+def get_brand_models(brand, limit=None):
+    """Названия моделей марки brand, отсортированные по частоте
+    встречаемости (самые ходовые — первыми) — из готового индекса,
+    посчитанного один раз при обновлении фида (см. _do_refresh),
+    вместо повторного прохода по всем лотам на каждый клик."""
+    ensure_fresh()
+    models = _cache["brand_models"].get(brand.strip().lower(), [])
+    return models[:limit] if limit else list(models)

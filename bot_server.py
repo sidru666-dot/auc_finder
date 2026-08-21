@@ -448,28 +448,11 @@ def lot_jmmoto_url(lot):
 
 
 def fetch_model_candidates(brand, limit=MODEL_BUTTON_LIMIT):
-    """Реальные названия моделей марки brand из текущих лотов фида aleado,
-    отсортированные по частоте встречаемости (самые ходовые — первыми)."""
-    counts = {}
-    order = []
-
-    def add(name):
-        name = (name or "").strip()
-        if not name:
-            return
-        if name not in counts:
-            counts[name] = 0
-            order.append(name)
-        counts[name] += 1
-
-    brand_l = brand.strip().lower()
-    for lot in aleado.get_lots():
-        if (lot.get("brand") or "").strip().lower() != brand_l:
-            continue
-        add(lot.get("model"))
-
-    order.sort(key=lambda k: (-counts[k], k))
-    return order[:limit]
+    """Реальные названия моделей марки brand, отсортированные по частоте
+    встречаемости (самые ходовые — первыми). Берётся из готового индекса
+    aleado_client (посчитан один раз при обновлении фида) — без повторного
+    прохода по всем 10+ тысячам лотов на каждое нажатие кнопки марки."""
+    return aleado.get_brand_models(brand, limit=limit)
 
 
 def format_lot_text(lot, brand, model, year):
@@ -521,10 +504,24 @@ def format_lot_text(lot, brand, model, year):
 # --------------------------------------------------------------------------
 
 
+# Жёсткий таймаут на отправку фото — send_photo с URL заставляет сами
+# серверы Telegram сходить за картинкой на aleado и подождать её; если
+# aleado в моменте отвечает медленно, наш вызов bot.send_photo будет
+# ждать столько же. Без явного timeout здесь используется таймаут по
+# умолчанию из Request (см. main() — con_pool_size/read_timeout), но
+# для media-методов лучше явно ограничить именно этот конкретный вызов,
+# чтобы одно медленное фото не подвешивало отправку остальных лотов в
+# очереди на много минут.
+PHOTO_SEND_TIMEOUT = 20
+
+
 def send_lot(bot, chat_id, text, photo_url=None):
     if photo_url:
         try:
-            bot.send_photo(chat_id=chat_id, photo=photo_url, caption=text, parse_mode="HTML")
+            bot.send_photo(
+                chat_id=chat_id, photo=photo_url, caption=text, parse_mode="HTML",
+                timeout=PHOTO_SEND_TIMEOUT,
+            )
             return
         except Exception as e:
             log.warning("send_photo failed, falling back to text: %s", e)
@@ -1377,7 +1374,25 @@ def main():
     # марку в /watch.
     threading.Thread(target=aleado.ensure_fresh, name="aleado-warmup", daemon=True).start()
 
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+    # ВАЖНО: python-telegram-bot 13.x по умолчанию создаёт HTTP-клиента к
+    # Telegram с con_pool_size=1 — то есть НА ВЕСЬ процесс всего ОДНО
+    # одновременное соединение к Bot API. Это был реальный источник
+    # "зависаний": фоновая проверка (check_job) в отдельном потоке шлёт
+    # bot.send_photo(...) с внешней ссылкой на фото — Telegram сам ходит
+    # за картинкой на сервер aleado и ждёт её, прежде чем ответить нам,
+    # и всё это время наш единственный HTTP-коннекшен занят. Любой другой
+    # вызов bot.* в этот момент (например query.answer() на нажатие
+    # кнопки пользователем) вставал в очередь за тем же единственным
+    # соединением и ждал — с виду это выглядело как "бот завис на нажатии
+    # кнопки", хотя на самом деле он просто ждал своей очереди к Telegram.
+    # Поднимаем пул соединений и число воркеров диспетчера, чтобы фоновые
+    # и интерактивные запросы к Bot API не блокировали друг друга.
+    updater = Updater(
+        token=TELEGRAM_TOKEN,
+        use_context=True,
+        workers=8,
+        request_kwargs={"con_pool_size": 10},
+    )
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler(["start", "help"], start_cmd))
