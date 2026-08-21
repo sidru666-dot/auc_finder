@@ -484,6 +484,14 @@ def _do_refresh():
                 table, len(rows), len(columns),
                 ", не нашлось соответствия для: {}".format(missing) if missing else "",
             )
+            if missing:
+                # Печатаем реальный список колонок и первую строку целиком —
+                # без этого не понять, как называется, например, марка в
+                # дампе конкретного поставщика, чтобы дописать её в
+                # FIELD_CANDIDATES.
+                log.info("aleado: таблица %s — все колонки: %s", table, columns)
+                if rows:
+                    log.info("aleado: таблица %s — первая строка: %s", table, rows[0])
 
         with _state_lock:
             _cache["tables"] = new_tables
