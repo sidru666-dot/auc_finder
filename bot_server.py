@@ -257,11 +257,26 @@ def describe_watch(w):
     )
 
 
+def _norm_text(s):
+    """Схлопывает любые пробелы (в т.ч. случайные двойные) в один и
+    обрезает края. Без этого достаточно одного лишнего пробела — при
+    ручном вводе марки/модели текстом (опечатка, автозамена, копипаста)
+    либо в самих данных фида (там встречается неряшливое форматирование
+    вроде "DUCATI  DIAVEL  STRADA" с двойным пробелом) — чтобы точное
+    или подстрочное сравнение сломалось и результат вообще не находился,
+    хотя по сути совпадение есть. Пример из жизни: пользователь ввёл
+    модель "STREET  TRIPLE 765 RS" (с двойным пробелом) — без нормализации
+    это НЕ подстрока настоящего "STREET TRIPLE 765 RS" в лоте, фильтр
+    сохранялся, но ничего не находил."""
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
 def matches(watch, brand, model_text, year, price, lot=None):
-    if (watch.get("brand") or "").lower() != brand.lower():
+    if _norm_text(watch.get("brand")).lower() != _norm_text(brand).lower():
         return False
     if watch.get("model"):
-        if not model_text or watch["model"].lower() not in model_text.lower():
+        model_norm = _norm_text(model_text).lower()
+        if not model_norm or _norm_text(watch["model"]).lower() not in model_norm:
             return False
     if watch.get("year_from") and (year is None or year < watch["year_from"]):
         return False
@@ -423,16 +438,16 @@ def similar_sold_stats(brand, model, limit=STAT_SAMPLE_SIZE):
 
     Возвращает None, если подходящих завершённых лотов не нашлось,
     иначе словарь с count/median_rub/min_rub/max_rub/sample."""
-    brand_l = (brand or "").strip().lower()
+    brand_l = _norm_text(brand).lower()
     if not brand_l:
         return None
-    model_l = (model or "").strip().lower()
+    model_l = _norm_text(model).lower()
 
     rows = []
     for lot in aleado.get_lots():
-        if (lot.get("brand") or "").strip().lower() != brand_l:
+        if _norm_text(lot.get("brand")).lower() != brand_l:
             continue
-        if model_l and (lot.get("model") or "").strip().lower() != model_l:
+        if model_l and _norm_text(lot.get("model")).lower() != model_l:
             continue
         if lot_is_open(lot):
             continue
@@ -606,6 +621,28 @@ def fetch_model_candidates(brand, limit=None):
     Без limit — весь список (листается кнопками в model_kb), а не только
     первые 18, как было раньше."""
     return aleado.get_brand_models(brand, limit=limit)
+
+
+def model_button_label(model, brand, max_len=26):
+    """Текст НА КНОПКЕ для модели: срезаем повторяющееся название марки
+    в начале строки (aleado отдаёт значения вида "DUCATI 848", а марка и
+    так уже показана отдельной строкой над кнопками) и только потом
+    обрезаем по длине многоточием. Раньше марка не срезалась — она же
+    съедала львиную долю и так тесных 26 символов на кнопке, из-за чего
+    почти любая модель длиннее пары слов обрезалась ещё до того, как
+    становилось видно что-то, кроме марки (жалоба: "не вмещается").
+    Срез только для ОТОБРАЖЕНИЯ — callback_data по-прежнему несёт индекс
+    в исходном списке candidates, так что draft["model"]/выбор модели
+    не меняются, срезанная строка нигде не сохраняется. Заодно схлопываем
+    случайные двойные пробелы из самих данных (см. _norm_text) — иначе
+    на кнопке остаётся некрасивое "  DIAVEL  STRADA"."""
+    m = _norm_text(model)
+    b = _norm_text(brand)
+    if b and m.lower().startswith(b.lower()):
+        rest = m[len(b):].lstrip(" -_/")
+        if rest:
+            m = rest
+    return m if len(m) <= max_len else m[:max_len - 1] + "…"
 
 
 def format_lot_text(lot, brand, model, year):
@@ -880,14 +917,16 @@ def brand_kb():
     return InlineKeyboardMarkup(rows)
 
 
-def model_kb(candidates, page=0):
+def model_kb(candidates, page=0, brand=None):
     """Кнопки моделей ОДНОЙ страницей (MODEL_PAGE_SIZE штук), плюс
     навигация "Ещё"/"Назад", если моделей у марки больше, чем влезает на
     экран — раньше показывались только первые MODEL_BUTTON_LIMIT (18) и
     остальные были вообще недоступны кнопкой, что и было жалобой: "тут
     явно не все модели". callback_data кнопки модели несёт АБСОЛЮТНЫЙ
     индекс в полном списке candidates (не индекс на странице) — так
-    modelidx: в on_callback остаётся рабочим без изменений."""
+    modelidx: в on_callback остаётся рабочим без изменений. `brand`
+    нужен только для текста кнопки (см. model_button_label) — срезать
+    повторяющуюся марку из подписи, само значение модели не трогаем."""
     total = len(candidates)
     start = page * MODEL_PAGE_SIZE
     end = start + MODEL_PAGE_SIZE
@@ -896,7 +935,7 @@ def model_kb(candidates, page=0):
     rows = []
     row = []
     for i, m in page_items:
-        label = m if len(m) <= 26 else m[:23] + "…"
+        label = model_button_label(m, brand)
         row.append(InlineKeyboardButton(label, callback_data="modelidx:{}".format(i)))
         if len(row) == 2:
             rows.append(row)
@@ -940,7 +979,7 @@ def stat_brand_kb():
     return InlineKeyboardMarkup(rows)
 
 
-def stat_model_kb(candidates, page=0):
+def stat_model_kb(candidates, page=0, brand=None):
     """Как model_kb(), но для раздела "Статистика": без свободного
     текстового ввода модели (для статистики нужна конкретная реальная
     модель из данных, чтобы сравнение было честным, а не "плавающим" по
@@ -953,7 +992,7 @@ def stat_model_kb(candidates, page=0):
     rows = []
     row = []
     for i, m in page_items:
-        label = m if len(m) <= 26 else m[:23] + "…"
+        label = model_button_label(m, brand)
         row.append(InlineKeyboardButton(label, callback_data="statmodelidx:{}".format(i)))
         if len(row) == 2:
             rows.append(row)
@@ -1235,7 +1274,7 @@ def on_callback(update: Update, context: CallbackContext):
                 "Марка: {}\nСейчас не нашёл активных лотов этой марки, чтобы "
                 "подсказать модели — выберите «Любая модель» или введите вручную:"
             ).format(brand)
-        context.bot.send_message(chat_id, note, reply_markup=model_kb(candidates))
+        context.bot.send_message(chat_id, note, reply_markup=model_kb(candidates, brand=brand))
         return
 
     if data.startswith("modelpage:"):
@@ -1243,7 +1282,9 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         candidates = draft.get("model_candidates", [])
         try:
-            query.edit_message_reply_markup(reply_markup=model_kb(candidates, page=page))
+            query.edit_message_reply_markup(
+                reply_markup=model_kb(candidates, page=page, brand=draft.get("brand"))
+            )
         except Exception:
             pass
         return
@@ -1297,7 +1338,7 @@ def on_callback(update: Update, context: CallbackContext):
                 "Марка: {}\nСейчас не нашёл лотов этой марки в данных — "
                 "статистику посчитать не по чему.".format(brand)
             )
-        context.bot.send_message(chat_id, note, reply_markup=stat_model_kb(candidates))
+        context.bot.send_message(chat_id, note, reply_markup=stat_model_kb(candidates, brand=brand))
         return
 
     if data.startswith("statmodelpage:"):
@@ -1305,7 +1346,9 @@ def on_callback(update: Update, context: CallbackContext):
         state = STAT_STATE.setdefault(chat_id, {})
         candidates = state.get("model_candidates", [])
         try:
-            query.edit_message_reply_markup(reply_markup=stat_model_kb(candidates, page=page))
+            query.edit_message_reply_markup(
+                reply_markup=stat_model_kb(candidates, page=page, brand=state.get("brand"))
+            )
         except Exception:
             pass
         return
@@ -1552,7 +1595,7 @@ def on_text(update: Update, context: CallbackContext):
         update.effective_message.reply_text("Марка: {}\nИщу модели в данных аукционов…".format(text))
         candidates = fetch_model_candidates(text)
         draft["model_candidates"] = candidates
-        update.effective_message.reply_text("Выберите модель:", reply_markup=model_kb(candidates))
+        update.effective_message.reply_text("Выберите модель:", reply_markup=model_kb(candidates, brand=text))
         return
 
     if awaiting == "statbrand_text":
@@ -1565,7 +1608,9 @@ def on_text(update: Update, context: CallbackContext):
         update.effective_message.reply_text("Марка: {}\nИщу модели в данных аукционов…".format(text))
         candidates = fetch_model_candidates(text)
         state["model_candidates"] = candidates
-        update.effective_message.reply_text("Выберите модель:", reply_markup=stat_model_kb(candidates))
+        update.effective_message.reply_text(
+            "Выберите модель:", reply_markup=stat_model_kb(candidates, brand=text)
+        )
         return
 
     if awaiting == "model_text":
@@ -1574,7 +1619,8 @@ def on_text(update: Update, context: CallbackContext):
         if text:
             brand = draft.get("brand", "")
             candidates = draft.get("model_candidates") or fetch_model_candidates(brand)
-            matched = [m for m in candidates if text.lower() in m.lower()]
+            text_norm = _norm_text(text).lower()
+            matched = [m for m in candidates if text_norm in _norm_text(m).lower()]
             if matched:
                 shown = matched[:15]
                 more = "" if len(matched) <= 15 else " и ещё {}".format(len(matched) - 15)
