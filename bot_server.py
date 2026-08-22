@@ -309,7 +309,33 @@ def matches(watch, brand, model_text, year, price, lot=None):
         if watch["free_text"].lower() not in haystack:
             return False
 
+    if not lot_is_open(lot):
+        return False
+
     return True
+
+
+# Значения поля "result", которые считаем "торги ещё не завершены" (лот
+# либо ещё не выставлялся, либо сейчас идёт торг) — всё остальное
+# (непустое значение вроде "sold"/"unsold"/любой другой исход) означает,
+# что аукцион уже завершён. Подтверждено вживую на jmmoto.ru: лот с
+# result="unsold" в фиде показывает на сайте "Аукцион завершён
+# (дата)" — а такие лоты не должны попадать ни в уведомления, ни в
+# "Показать, что есть сейчас" в режиме "Аукционы онлайн" (это именно
+# витрина ЖИВЫХ/предстоящих торгов, а не архив прошедших).
+_OPEN_RESULT_TOKENS = {"", "-", "none", "null", "n/a", "na", "0", "нет", "pending", "ожидание", "-1"}
+
+
+def lot_is_open(lot):
+    """True, если аукцион по лоту ещё не завершён (можно показывать в
+    "Аукционы онлайн" / слать уведомление). Судим по полю result: как
+    только торги проходят, aleado проставляет туда исход ("sold",
+    "unsold" и т.п.) — до этого поле пустое."""
+    result = lot.get("result")
+    if result is None:
+        return True
+    token = str(result).strip().lower()
+    return token in _OPEN_RESULT_TOKENS
 
 
 def parse_price(text):
@@ -1238,7 +1264,21 @@ def finalize_watch(query, context, chat_id, draft):
     w["chat_id"] = chat_id
     w["brand"] = brand
     DRAFTS.pop(chat_id, None)
-    query.edit_message_text("✅ Фильтр сохранён:\n{}".format(describe_watch(w)))
+    # ВАЖНО: раньше здесь клавиатура пропадала совсем, а старая кнопка
+    # "Показать, что есть сейчас" в предыдущем сообщении (confirm_kb())
+    # была всё ещё видна, но нажатие на неё после сохранения ничего не
+    # находило — она читала DRAFTS[chat_id], а он уже пуст (см. return
+    # ниже). Теперь заменяем клавиатуру на кнопку "Показать, что есть
+    # сейчас", которая ссылается на УЖЕ СОХРАНЁННЫЙ фильтр по его id
+    # (тот же механизм "checknow:", что и в "Мои оповещения" — он читает
+    # фильтр из базы, а не из временного черновика) — сохранение больше
+    # не отбирает возможность посмотреть текущие лоты.
+    query.edit_message_text(
+        "✅ Фильтр сохранён:\n{}".format(describe_watch(w)),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👀 Показать, что есть сейчас", callback_data="checknow:{}".format(watch_id))],
+        ]),
+    )
     context.bot.send_message(chat_id, "Готово. Ждите уведомлений о новых лотах.", reply_markup=main_menu_kb())
 
 
@@ -1275,6 +1315,24 @@ def on_text(update: Update, context: CallbackContext):
     if awaiting == "model_text":
         draft["model"] = text or None
         draft.pop("awaiting", None)
+        if text:
+            brand = draft.get("brand", "")
+            candidates = draft.get("model_candidates") or fetch_model_candidates(brand)
+            matched = [m for m in candidates if text.lower() in m.lower()]
+            if matched:
+                shown = matched[:15]
+                more = "" if len(matched) <= 15 else " и ещё {}".format(len(matched) - 15)
+                update.effective_message.reply_text(
+                    "Под текст «{}» сейчас попадают модели ({} шт. в фиде): {}{}".format(
+                        text, len(matched), ", ".join(shown), more
+                    )
+                )
+            else:
+                update.effective_message.reply_text(
+                    "⚠️ Ни одна модель в текущих данных аукционов не содержит «{}» — "
+                    "скорее всего, уведомлений не будет. Попробуйте более короткий "
+                    "фрагмент названия (например, без цифр/года).".format(text)
+                )
         update.effective_message.reply_text("Год от:", reply_markup=year_kb("yf"))
         return
 
