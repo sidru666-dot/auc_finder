@@ -172,8 +172,8 @@ HELP_TEXT = (
     "когда сами захотите ввести марку/модель/цифру вручную):\n"
     "🏍 «Аукционы онлайн» — задать марку/модель/годы/цену и другие "
     "фильтры кнопками, как на сайте, и сразу посмотреть, что подходит\n"
-    "📊 «Статистика» — история проданных лотов (пока недоступна, см. "
-    "пояснение в самой кнопке)\n"
+    "📊 «Статистика» — медиана и разброс цены последних проданных лотов "
+    "марки/модели на аукционе в Японии (без растаможки и доставки)\n"
     "🔔 «Мои оповещения» — список сохранённых фильтров: можно мгновенно "
     "проверить или удалить\n\n"
     "Команды остаются для тех, кому так привычнее: /watch (то же самое, "
@@ -200,6 +200,13 @@ HELP_TEXT = (
 #             "year_from":..., "year_to":..., "max_price":...,
 #             "awaiting": "brand_text"|"model_text"|"yf_text"|"yt_text"|"price_text"|None}
 DRAFTS = {}
+
+# Черновик диалога раздела "📊 Статистика" (марка -> список моделей на
+# выбор) — отдельно от DRAFTS, чтобы не пересекаться с незаконченной
+# настройкой фильтра в "Аукционы онлайн", если пользователь одновременно
+# начал и то, и другое:
+# chat_id -> {"brand":..., "model_candidates": [...]}
+STAT_STATE = {}
 
 # --------------------------------------------------------------------------
 # Вспомогательные функции показа/логики фильтров
@@ -392,6 +399,121 @@ def lot_price_label(lot):
     return "¥{} (≈{} ₽)".format(format_rub(jpy), format_rub(rub))
 
 
+# Сколько последних ПРОДАННЫХ/завершённых лотов той же марки+модели
+# брать для прикидки цены (и в карточке лота в "Аукционы онлайн", и в
+# разделе "Статистика") — намеренно небольшое число и без претензии на
+# серьёзный анализ по всему фиду (там десятки тысяч строк): просто
+# медиана и разброс по последним нескольким реально завершённым торгам,
+# чтобы было примерное понимание уровня цены, а не точный расчёт.
+STAT_SAMPLE_SIZE = 10
+
+
+def similar_sold_stats(brand, model, limit=STAT_SAMPLE_SIZE):
+    """Последние `limit` уже завершённых (см. lot_is_open) лотов той же
+    марки и (если модель задана) модели — с ценой, за которую они ушли
+    на аукционе. Модель сравнивается ТОЧНО (не подстрокой) — это те же
+    строки, что показываются кнопками выбора модели, так что сравнение
+    честное и не смешивает разные модели вместе.
+
+    ВАЖНО: цена здесь — это цена аукциона В ЯПОНИИ (йены, пересчёт в
+    рубли по курсу ЦБ) — БЕЗ растаможки, логистики и доставки до России.
+    Настоящая "цена под ключ в РФ" (как на jmmoto.ru/auc-stat) требует
+    отдельного расчёта пошлин/доставки, которого в этом фиде нет — эта
+    цифра только для примерной ориентировки по уровню цены на торгах.
+
+    Возвращает None, если подходящих завершённых лотов не нашлось,
+    иначе словарь с count/median_rub/min_rub/max_rub/sample."""
+    brand_l = (brand or "").strip().lower()
+    if not brand_l:
+        return None
+    model_l = (model or "").strip().lower()
+
+    rows = []
+    for lot in aleado.get_lots():
+        if (lot.get("brand") or "").strip().lower() != brand_l:
+            continue
+        if model_l and (lot.get("model") or "").strip().lower() != model_l:
+            continue
+        if lot_is_open(lot):
+            continue
+        price = lot_price_rub(lot)
+        if price is None:
+            continue
+        rows.append((str(lot.get("auction_date") or ""), lot, price))
+
+    if not rows:
+        return None
+
+    rows.sort(key=lambda r: r[0], reverse=True)
+    top = rows[:limit]
+    prices = sorted(p for _, _, p in top)
+    n = len(prices)
+    median = prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2
+
+    return {
+        "count": n,
+        "median_rub": median,
+        "min_rub": prices[0],
+        "max_rub": prices[-1],
+        "sample": top,
+    }
+
+
+def format_stats_block(stats):
+    """Короткая строка для карточки лота в "Аукционы онлайн" — не
+    выводим, если сравнивать особо не с чем (меньше 2 завершённых
+    лотов), чтобы не засорять каждую карточку почти пустой статистикой."""
+    if not stats or stats["count"] < 2:
+        return None
+    return (
+        "📊 Похожие проданные лоты (посл. {}): медиана ≈{} ₽ (от {} до {} ₽, "
+        "цена торгов в Японии, без растаможки/доставки)".format(
+            stats["count"], format_rub(stats["median_rub"]),
+            format_rub(stats["min_rub"]), format_rub(stats["max_rub"]),
+        )
+    )
+
+
+def format_stats_text(brand, model, stats):
+    """Полный текст для раздела "📊 Статистика" — марка+модель, список
+    последних проданных лотов и итоговая медиана/разброс."""
+    model_s = model or "любая модель"
+    if not stats:
+        return (
+            "По «{} / {}» завершённых торгов в текущих данных фида пока нет.".format(
+                html.escape(brand), html.escape(model_s)
+            )
+        )
+
+    lines = [
+        "📊 <b>{} / {}</b> — последние {} проданных лотов:".format(
+            html.escape(brand), html.escape(model_s), stats["count"]
+        ),
+        "",
+    ]
+    for date_s, lot, price in stats["sample"]:
+        year = lot_year(lot) or "?"
+        mileage = lot.get("mileage") or "?"
+        result = lot.get("result") or "?"
+        lines.append(
+            "• {} | год {} | пробег {} | {} | {}".format(
+                html.escape(date_s or "дата ?"), year, html.escape(str(mileage)),
+                html.escape(lot_price_label(lot)), html.escape(str(result)),
+            )
+        )
+    lines.append("")
+    lines.append(
+        "Медиана: ≈{} ₽ (разброс {}–{} ₽)".format(
+            format_rub(stats["median_rub"]), format_rub(stats["min_rub"]), format_rub(stats["max_rub"]),
+        )
+    )
+    lines.append(
+        "⚠️ Это цена аукциона в Японии на момент продажи — без растаможки, "
+        "логистики и доставки в РФ, не окончательная стоимость \"под ключ\"."
+    )
+    return "\n".join(lines)
+
+
 def lot_grade_label(lot):
     parts = []
     if lot.get("grade_overall"):
@@ -521,6 +643,10 @@ def format_lot_text(lot, brand, model, year):
         lines.append("VIN: {}".format(html.escape(str(lot["vin"]))))
     if lot.get("result"):
         lines.append("Результат торгов: {}".format(html.escape(str(lot["result"]))))
+
+    stats_line = format_stats_block(similar_sold_stats(brand, model))
+    if stats_line:
+        lines.append(html.escape(stats_line))
 
     lines.append(
         '<a href="{}">Смотреть на jmmoto.ru</a> | Источник: aleado (Япония)'.format(
@@ -795,6 +921,62 @@ def model_kb(candidates, page=0):
     return InlineKeyboardMarkup(rows)
 
 
+def stat_brand_kb():
+    """Та же раскладка, что и brand_kb(), но с другим префиксом
+    callback_data ("statbrand:") — раздел "📊 Статистика" ведёт себя как
+    отдельный, независимый диалог (STAT_STATE), а не пересекается с
+    черновиком фильтра "Аукционы онлайн" (DRAFTS)."""
+    rows = []
+    row = []
+    for b in BRANDS:
+        row.append(InlineKeyboardButton(b, callback_data="statbrand:{}".format(b)))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Другая марка (ввести)", callback_data="statbrand:{}".format(OTHER_BRAND))])
+    rows.append([InlineKeyboardButton("✖ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def stat_model_kb(candidates, page=0):
+    """Как model_kb(), но для раздела "Статистика": без свободного
+    текстового ввода модели (для статистики нужна конкретная реальная
+    модель из данных, чтобы сравнение было честным, а не "плавающим" по
+    подстроке), зато с пагинацией и вариантом "Вся марка целиком"."""
+    total = len(candidates)
+    start = page * MODEL_PAGE_SIZE
+    end = start + MODEL_PAGE_SIZE
+    page_items = list(enumerate(candidates))[start:end]
+
+    rows = []
+    row = []
+    for i, m in page_items:
+        label = m if len(m) <= 26 else m[:23] + "…"
+        row.append(InlineKeyboardButton(label, callback_data="statmodelidx:{}".format(i)))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Назад", callback_data="statmodelpage:{}".format(page - 1)))
+    if end < total:
+        nav.append(InlineKeyboardButton(
+            "▶️ Ещё модели ({}/{})".format(min(end, total), total),
+            callback_data="statmodelpage:{}".format(page + 1),
+        ))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("Вся марка целиком", callback_data="statmodel:any")])
+    rows.append([InlineKeyboardButton("✖ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 def year_choices():
     y = datetime.date.today().year
     ys = sorted({y + 1, y, y - 1, y - 2, y - 3, y - 5, y - 8, y - 12, y - 18, y - 25}, reverse=True)
@@ -959,6 +1141,7 @@ def on_callback(update: Update, context: CallbackContext):
 
     if data == "cancel":
         DRAFTS.pop(chat_id, None)
+        STAT_STATE.pop(chat_id, None)
         query.edit_message_text("Отменено.")
         context.bot.send_message(chat_id, "Главное меню:", reply_markup=main_menu_kb())
         return
@@ -969,13 +1152,18 @@ def on_callback(update: Update, context: CallbackContext):
         return
 
     if data == "menu:stats":
+        # Полноценной "статистики под ключ" (как на jmmoto.ru/auc-stat, с
+        # растаможкой и доставкой) в самом фиде aleado нет — там только
+        # цена аукциона в Японии. Но уже ЗАВЕРШЁННЫЕ лоты (result уже
+        # проставлен) в фиде есть — это те же данные, что используются
+        # для фильтрации lot_is_open(). Раздел показывает по ним медиану
+        # и разброс цены последних нескольких проданных лотов марки/
+        # модели — без претензии на точный расчёт "под ключ".
+        STAT_STATE[chat_id] = {}
         query.edit_message_text(
-            "«Статистика» (история проданных лотов, как на jmmoto.ru) пока "
-            "недоступна: для неё нужен отдельный раздел фида aleado с уже "
-            "прошедшими торгами, а сейчас подключены только текущие/будущие "
-            "лоты («Аукционы онлайн»). Как только появится доступ к данным "
-            "по статистике — добавлю этот раздел и сюда.",
-            reply_markup=main_menu_kb(),
+            "📊 Статистика — цена последних проданных лотов на аукционе в "
+            "Японии (без растаможки и доставки в РФ).\nВыберите марку:",
+            reply_markup=stat_brand_kb(),
         )
         return
 
@@ -1080,6 +1268,61 @@ def on_callback(update: Update, context: CallbackContext):
         else:
             draft["awaiting"] = "model_text"
             query.edit_message_text("Напишите модель текстом (одно сообщение):")
+        return
+
+    # ------------------------------------------------------------------
+    # Раздел "📊 Статистика" — отдельный, независимый от DRAFTS диалог
+    # (см. STAT_STATE), марка -> модель -> медиана/разброс по последним
+    # проданным лотам (similar_sold_stats/format_stats_text).
+    # ------------------------------------------------------------------
+
+    if data.startswith("statbrand:"):
+        brand = data.split(":", 1)[1]
+        if brand == OTHER_BRAND:
+            draft = DRAFTS.setdefault(chat_id, {})
+            draft["awaiting"] = "statbrand_text"
+            query.edit_message_text("Напишите марку текстом (одно сообщение):")
+            return
+        state = STAT_STATE.setdefault(chat_id, {})
+        state["brand"] = brand
+        query.edit_message_text(
+            "Марка: {}\nИщу модели в данных аукционов…".format(brand)
+        )
+        candidates = fetch_model_candidates(brand)
+        state["model_candidates"] = candidates
+        if candidates:
+            note = "Марка: {}\nВыберите модель:".format(brand)
+        else:
+            note = (
+                "Марка: {}\nСейчас не нашёл лотов этой марки в данных — "
+                "статистику посчитать не по чему.".format(brand)
+            )
+        context.bot.send_message(chat_id, note, reply_markup=stat_model_kb(candidates))
+        return
+
+    if data.startswith("statmodelpage:"):
+        page = int(data.split(":", 1)[1])
+        state = STAT_STATE.setdefault(chat_id, {})
+        candidates = state.get("model_candidates", [])
+        try:
+            query.edit_message_reply_markup(reply_markup=stat_model_kb(candidates, page=page))
+        except Exception:
+            pass
+        return
+
+    if data.startswith("statmodelidx:") or data == "statmodel:any":
+        state = STAT_STATE.get(chat_id, {})
+        brand = state.get("brand", "?")
+        if data == "statmodel:any":
+            model = None
+        else:
+            idx = int(data.split(":", 1)[1])
+            candidates = state.get("model_candidates", [])
+            model = candidates[idx] if 0 <= idx < len(candidates) else None
+        stats = similar_sold_stats(brand, model)
+        query.edit_message_text(format_stats_text(brand, model, stats), parse_mode="HTML")
+        STAT_STATE.pop(chat_id, None)
+        context.bot.send_message(chat_id, "Главное меню:", reply_markup=main_menu_kb())
         return
 
     if data.startswith("yf:"):
@@ -1310,6 +1553,19 @@ def on_text(update: Update, context: CallbackContext):
         candidates = fetch_model_candidates(text)
         draft["model_candidates"] = candidates
         update.effective_message.reply_text("Выберите модель:", reply_markup=model_kb(candidates))
+        return
+
+    if awaiting == "statbrand_text":
+        draft.pop("awaiting", None)
+        if not text:
+            update.effective_message.reply_text("Пустая марка не подходит, напишите ещё раз:")
+            return
+        state = STAT_STATE.setdefault(chat_id, {})
+        state["brand"] = text
+        update.effective_message.reply_text("Марка: {}\nИщу модели в данных аукционов…".format(text))
+        candidates = fetch_model_candidates(text)
+        state["model_candidates"] = candidates
+        update.effective_message.reply_text("Выберите модель:", reply_markup=stat_model_kb(candidates))
         return
 
     if awaiting == "model_text":
