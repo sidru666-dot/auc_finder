@@ -820,6 +820,12 @@ def check_all(bot):
         year = lot_year(lot)
         price = lot_price_rub(lot)
 
+        if "triumph" in brand.lower():
+            log.info(
+                "DEBUG_TRIUMPH lot_id=%r brand=%r model=%r result=%r year=%r is_open=%r",
+                lot_id, brand, model, lot.get("result"), year, lot_is_open(lot),
+            )
+
         for w in watches:
             if not matches(w, brand, model, year, price, lot=lot):
                 continue
@@ -861,6 +867,9 @@ def send_preview(context, chat_id, watch):
     except Exception:
         pass
 
+    if "triumph" in (watch.get("brand") or "").lower():
+        log.info("DEBUG_PREVIEW watch_brand=%r watch_model=%r", watch.get("brand"), watch.get("model"))
+
     items = []
     for lot in aleado.get_lots():
         lbrand = (lot.get("brand") or "").strip()
@@ -869,7 +878,13 @@ def send_preview(context, chat_id, watch):
         lmodel = lot.get("model") or ""
         year = lot_year(lot)
         price = lot_price_rub(lot)
-        if not matches(watch, lbrand, lmodel, year, price, lot=lot):
+        is_match = matches(watch, lbrand, lmodel, year, price, lot=lot)
+        if "triumph" in lbrand.lower():
+            log.info(
+                "DEBUG_PREVIEW_LOT lot_id=%r brand=%r model=%r result=%r year=%r matched=%r",
+                lot.get("lot_id"), lbrand, lmodel, lot.get("result"), year, is_match,
+            )
+        if not is_match:
             continue
         items.append({"text": format_lot_text(lot, lbrand, lmodel, year), "photo": lot_photo(lot)})
 
