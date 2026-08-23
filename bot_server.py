@@ -337,27 +337,37 @@ def matches(watch, brand, model_text, year, price, lot=None):
     return True
 
 
-# Значения поля "result", которые считаем "торги ещё не завершены" (лот
-# либо ещё не выставлялся, либо сейчас идёт торг) — всё остальное
-# (непустое значение вроде "sold"/"unsold"/любой другой исход) означает,
-# что аукцион уже завершён. Подтверждено вживую на jmmoto.ru: лот с
-# result="unsold" в фиде показывает на сайте "Аукцион завершён
-# (дата)" — а такие лоты не должны попадать ни в уведомления, ни в
-# "Показать, что есть сейчас" в режиме "Аукционы онлайн" (это именно
-# витрина ЖИВЫХ/предстоящих торгов, а не архив прошедших).
-_OPEN_RESULT_TOKENS = {"", "-", "none", "null", "n/a", "na", "0", "нет", "pending", "ожидание", "-1"}
+# Значения поля "result", которые считаем "торги уже завершены" — лот
+# больше не должен попадать ни в уведомления, ни в "Показать, что есть
+# сейчас" (это витрина ЖИВЫХ/предстоящих торгов, а не архив прошедших).
+#
+# ВАЖНО: раньше здесь была обратная логика — белый список "открытых"
+# значений (пусто/none/pending и т.п.), всё остальное непустое считалось
+# "уже продано". Это было ошибкой: живая выгрузка фида показала, что
+# aleado проставляет result="available" для ЛЮБОГО лота, который ещё
+# идёт (не только для пустого поля) — из-за старой логики ВСЕ текущие
+# торги считались завершёнными и полностью пропадали из поиска и
+# уведомлений (реальный пример: Triumph Street Triple RS 2023,
+# result="available", жив на jmmoto.ru — бот показывал "ничего не
+# найдено"). Судя по реальным данным фида, у result всего три значения:
+# "available" (торг идёт), "sold" и "unsold" (торг завершён) — поэтому
+# теперь наоборот: чёрный список завершённых исходов, всё остальное
+# (включая "available", пустое значение и любой пока неизвестный статус)
+# считаем открытым — так новый/непредвиденный статус не прячет живой лот.
+_CLOSED_RESULT_TOKENS = {"sold", "unsold", "продан", "не продан", "непродан"}
 
 
 def lot_is_open(lot):
     """True, если аукцион по лоту ещё не завершён (можно показывать в
     "Аукционы онлайн" / слать уведомление). Судим по полю result: как
     только торги проходят, aleado проставляет туда исход ("sold",
-    "unsold" и т.п.) — до этого поле пустое."""
+    "unsold") — пока лот жив (в т.ч. result="available"), к закрытым
+    исходам он не относится."""
     result = lot.get("result")
     if result is None:
         return True
     token = str(result).strip().lower()
-    return token in _OPEN_RESULT_TOKENS
+    return token not in _CLOSED_RESULT_TOKENS
 
 
 def parse_price(text):
@@ -820,12 +830,6 @@ def check_all(bot):
         year = lot_year(lot)
         price = lot_price_rub(lot)
 
-        if "triumph" in brand.lower():
-            log.info(
-                "DEBUG_TRIUMPH lot_id=%r brand=%r model=%r result=%r year=%r is_open=%r",
-                lot_id, brand, model, lot.get("result"), year, lot_is_open(lot),
-            )
-
         for w in watches:
             if not matches(w, brand, model, year, price, lot=lot):
                 continue
@@ -867,9 +871,6 @@ def send_preview(context, chat_id, watch):
     except Exception:
         pass
 
-    if "triumph" in (watch.get("brand") or "").lower():
-        log.info("DEBUG_PREVIEW watch_brand=%r watch_model=%r", watch.get("brand"), watch.get("model"))
-
     items = []
     for lot in aleado.get_lots():
         lbrand = (lot.get("brand") or "").strip()
@@ -878,13 +879,7 @@ def send_preview(context, chat_id, watch):
         lmodel = lot.get("model") or ""
         year = lot_year(lot)
         price = lot_price_rub(lot)
-        is_match = matches(watch, lbrand, lmodel, year, price, lot=lot)
-        if "triumph" in lbrand.lower():
-            log.info(
-                "DEBUG_PREVIEW_LOT lot_id=%r brand=%r model=%r result=%r year=%r matched=%r",
-                lot.get("lot_id"), lbrand, lmodel, lot.get("result"), year, is_match,
-            )
-        if not is_match:
+        if not matches(watch, lbrand, lmodel, year, price, lot=lot):
             continue
         items.append({"text": format_lot_text(lot, lbrand, lmodel, year), "photo": lot_photo(lot)})
 
