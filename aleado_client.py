@@ -167,7 +167,7 @@ _cache = {
     "ts": 0.0,
     "tables": {},   # table_name -> {"columns": [...], "resolved": {...}, "rows": [dict,...]}
     "lots": [],     # готовые словари лотов (канонические поля), посчитано один раз за обновление
-    "brand_models": {},  # brand.lower() -> [model, ...] отсортировано по частоте, посчитано один раз за обновление
+    "brand_models": {},  # brand.lower() -> [model, ...] отсортировано по алфавиту, посчитано один раз за обновление
     "error": None,
 }
 
@@ -579,8 +579,27 @@ def _do_refresh():
                 counts = brand_model_counts.setdefault(brand.lower(), {})
                 counts[model] = counts.get(model, 0) + 1
 
+        # Раньше модели сортировались по частоте встречаемости (самые
+        # ходовые — первыми). Живой пользователь попросил алфавитный
+        # порядок — "если знаешь что хочешь XSR, листаешь в конец" —
+        # по частоте так не сориентироваться, а по алфавиту это
+        # предсказуемо. Сортируем по НОРМАЛИЗОВАННОМУ виду (пробелы
+        # схлопнуты, повторяющаяся марка спереди срезана), а не по
+        # сырой строке из фида — так порядок совпадает с тем, что
+        # реально показано на кнопках (см. model_button_label в
+        # bot_server.py), а не с сырым текстом вроде " TRIUMPH  TIGER
+        # 900 RALLY PRO" (там алфавитный порядок по сырой строке был бы
+        # бессмысленным — она вся начиналась бы на "TRIUMPH").
+        def _model_sort_key(model, brand_lower):
+            m = re.sub(r"\s+", " ", (model or "").strip())
+            if m.upper().startswith(brand_lower.upper()):
+                rest = m[len(brand_lower):].lstrip(" -_/")
+                if rest:
+                    m = rest
+            return m.upper()
+
         brand_models = {
-            brand_lower: sorted(counts.keys(), key=lambda m: (-counts[m], m))
+            brand_lower: sorted(counts.keys(), key=lambda m: _model_sort_key(m, brand_lower))
             for brand_lower, counts in brand_model_counts.items()
         }
 
@@ -658,10 +677,13 @@ def get_lots(table=None):
 
 
 def get_brand_models(brand, limit=None):
-    """Названия моделей марки brand, отсортированные по частоте
-    встречаемости (самые ходовые — первыми) — из готового индекса,
-    посчитанного один раз при обновлении фида (см. _do_refresh),
-    вместо повторного прохода по всем лотам на каждый клик."""
+    """Названия моделей марки brand, отсортированные по алфавиту (по
+    нормализованному виду — см. _model_sort_key в _do_refresh) — из
+    готового индекса, посчитанного один раз при обновлении фида (см.
+    _do_refresh), вместо повторного прохода по всем лотам на каждый
+    клик. Раньше сортировка была по частоте встречаемости, но так
+    сложно ориентироваться, зная точное название модели — алфавитный
+    порядок предсказуемее."""
     ensure_fresh()
     models = _cache["brand_models"].get(brand.strip().lower(), [])
     return models[:limit] if limit else list(models)

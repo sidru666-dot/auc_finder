@@ -371,13 +371,48 @@ def lot_is_open(lot):
 
 
 def parse_price(text):
+    """Число из текста, введённого вручную. Понимает не только голое
+    число, но и разговорные сокращения — "500к"/"500k"/"500 тыс" (×1000),
+    "1.5м"/"1.5 млн" (×1000000). Без этого, например, цена "500к" после
+    простого отбрасывания буквы читалась бы как "500" — в 1000 раз
+    меньше задуманного (жалоба живого пользователя: "цена указана
+    некорректно, сокращённая на 3 нуля")."""
     if not text:
         return None
-    digits = re.sub(r"[^\d.]", "", str(text))
+    s = str(text).strip().lower().replace(",", ".")
+    m = re.fullmatch(r"([\d.]+)\s*(?:к|k|тыс\.?|т)", s)
+    if m:
+        try:
+            return float(m.group(1)) * 1_000
+        except ValueError:
+            return None
+    m = re.fullmatch(r"([\d.]+)\s*(?:м|m|млн\.?)", s)
+    if m:
+        try:
+            return float(m.group(1)) * 1_000_000
+        except ValueError:
+            return None
+    digits = re.sub(r"[^\d.]", "", s)
     try:
         return float(digits) if digits else None
     except ValueError:
         return None
+
+
+def format_mileage(raw):
+    """Пробег из фида для показа пользователю — разворачиваем в полное
+    число с "км", вместо того чтобы печатать значение из фида как есть.
+    Японские аукционные протоколы часто пишут пробег как "104K" (104
+    тысячи км) — тот же формат, что parse_price() уже понимает выше.
+    Без разворачивания это читается двусмысленно (жалоба живого
+    пользователя: "в графе пробег указано 104к, сразу подумал что
+    104 тысячи км... а то как-то двусмысленно")."""
+    if not raw:
+        return None
+    km = parse_price(raw)
+    if km is None:
+        return str(raw)
+    return "{} км".format(format_rub(km))
 
 
 def parse_manual_year(text):
@@ -518,7 +553,7 @@ def format_stats_text(brand, model, stats):
     ]
     for date_s, lot, price in stats["sample"]:
         year = lot_year(lot) or "?"
-        mileage = lot.get("mileage") or "?"
+        mileage = format_mileage(lot.get("mileage")) or "?"
         result = lot.get("result") or "?"
         lines.append(
             "• {} | год {} | пробег {} | {} | {}".format(
@@ -665,8 +700,9 @@ def format_lot_text(lot, brand, model, year):
         lines.append("Оценка состояния: {}".format(html.escape(grade)))
 
     meta = []
-    if lot.get("mileage"):
-        meta.append("пробег {}".format(lot["mileage"]))
+    mileage = format_mileage(lot.get("mileage"))
+    if mileage:
+        meta.append("пробег {}".format(mileage))
     if lot.get("engine_volume"):
         meta.append("объём {}".format(lot["engine_volume"]))
     if lot.get("color"):
@@ -912,6 +948,16 @@ def main_menu_kb():
     ])
 
 
+def back_kb(target):
+    """Одна кнопка "Назад" для экранов свободного текстового ввода (там,
+    где своей клавиатуры со списком нет, а значит без этой кнопки
+    единственный путь назад — /cancel и настройка фильтра с нуля,
+    ровно то, на что жаловались: "не нажимать отмена и начинать всё
+    сначала"). `target` — callback_data экрана, к которому возвращаемся
+    (например "back:model" или "adv:menu")."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=target)]])
+
+
 def brand_kb():
     rows = []
     row = []
@@ -955,7 +1001,7 @@ def model_kb(candidates, page=0, brand=None):
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀️ Назад", callback_data="modelpage:{}".format(page - 1)))
+        nav.append(InlineKeyboardButton("◀️ Пред. страница", callback_data="modelpage:{}".format(page - 1)))
     if end < total:
         nav.append(InlineKeyboardButton(
             "▶️ Ещё модели ({}/{})".format(min(end, total), total),
@@ -966,6 +1012,7 @@ def model_kb(candidates, page=0, brand=None):
 
     rows.append([InlineKeyboardButton("Любая модель", callback_data="model:any")])
     rows.append([InlineKeyboardButton("Указать модель (ввести текст)", callback_data="model:text")])
+    rows.append([InlineKeyboardButton("🔙 К выбору марки", callback_data="back:brand")])
     rows.append([InlineKeyboardButton("✖ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -1012,7 +1059,7 @@ def stat_model_kb(candidates, page=0, brand=None):
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀️ Назад", callback_data="statmodelpage:{}".format(page - 1)))
+        nav.append(InlineKeyboardButton("◀️ Пред. страница", callback_data="statmodelpage:{}".format(page - 1)))
     if end < total:
         nav.append(InlineKeyboardButton(
             "▶️ Ещё модели ({}/{})".format(min(end, total), total),
@@ -1022,6 +1069,7 @@ def stat_model_kb(candidates, page=0, brand=None):
         rows.append(nav)
 
     rows.append([InlineKeyboardButton("Вся марка целиком", callback_data="statmodel:any")])
+    rows.append([InlineKeyboardButton("🔙 К выбору марки", callback_data="statback:brand")])
     rows.append([InlineKeyboardButton("✖ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -1044,6 +1092,8 @@ def year_kb(prefix):
         rows.append(row)
     rows.append([InlineKeyboardButton("Без ограничения", callback_data="{}:none".format(prefix))])
     rows.append([InlineKeyboardButton("Ввести вручную", callback_data="{}:text".format(prefix))])
+    back_step = "model" if prefix == "yf" else "yf"
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="back:{}".format(back_step))])
     rows.append([InlineKeyboardButton("✖ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -1066,6 +1116,7 @@ def price_kb():
         rows.append(row)
     rows.append([InlineKeyboardButton("Без ограничения", callback_data="price:none")])
     rows.append([InlineKeyboardButton("Ввести вручную", callback_data="price:text")])
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="back:yt")])
     rows.append([InlineKeyboardButton("✖ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -1079,7 +1130,12 @@ ENGINE_VALUES = [125, 250, 400, 600, 750, 900, 1000, 1300]
 GRADE_VALUES = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
 
 
-def range_kb(prefix, values, suffix=""):
+def range_kb(prefix, values, suffix="", back="adv:menu"):
+    """`back` — куда ведёт кнопка "Назад": по умолчанию к меню доп.
+    фильтров (актуально для первого поля пары "от"), но для второго поля
+    пары ("до") её передают равной callback_data экрана "от" — так
+    "назад" всегда возвращает на предыдущий шаг, а не перескакивает
+    сразу в меню, теряя уже выбранное значение "от"."""
     rows = []
     row = []
     for v in values:
@@ -1091,7 +1147,7 @@ def range_kb(prefix, values, suffix=""):
         rows.append(row)
     rows.append([InlineKeyboardButton("Без ограничения", callback_data="{}:none".format(prefix))])
     rows.append([InlineKeyboardButton("Ввести вручную", callback_data="{}:text".format(prefix))])
-    rows.append([InlineKeyboardButton("‹ Назад к доп. фильтрам", callback_data="adv:menu")])
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data=back)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1116,6 +1172,7 @@ def adv_menu_kb(draft):
         [InlineKeyboardButton("{}VIN / номер рамы".format(mark(draft.get("vin"))), callback_data="adv:vin")],
         [InlineKeyboardButton("{}Свободный поиск (текст)".format(mark(draft.get("free_text"))), callback_data="adv:text")],
         [InlineKeyboardButton("✅ Готово, к сохранению", callback_data="adv:done")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back:price")],
         [InlineKeyboardButton("✖ Отмена", callback_data="cancel")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -1266,7 +1323,7 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if brand == OTHER_BRAND:
             draft["awaiting"] = "brand_text"
-            query.edit_message_text("Напишите марку текстом (одно сообщение):")
+            query.edit_message_text("Напишите марку текстом (одно сообщение):", reply_markup=back_kb("back:brand"))
             return
         draft["brand"] = brand
         draft.pop("awaiting", None)
@@ -1318,7 +1375,7 @@ def on_callback(update: Update, context: CallbackContext):
             query.edit_message_text("Модель: любая\nГод от:", reply_markup=year_kb("yf"))
         else:
             draft["awaiting"] = "model_text"
-            query.edit_message_text("Напишите модель текстом (одно сообщение):")
+            query.edit_message_text("Напишите модель текстом (одно сообщение):", reply_markup=back_kb("back:model"))
         return
 
     # ------------------------------------------------------------------
@@ -1332,7 +1389,7 @@ def on_callback(update: Update, context: CallbackContext):
         if brand == OTHER_BRAND:
             draft = DRAFTS.setdefault(chat_id, {})
             draft["awaiting"] = "statbrand_text"
-            query.edit_message_text("Напишите марку текстом (одно сообщение):")
+            query.edit_message_text("Напишите марку текстом (одно сообщение):", reply_markup=back_kb("statback:brand"))
             return
         state = STAT_STATE.setdefault(chat_id, {})
         state["brand"] = brand
@@ -1383,7 +1440,10 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if val == "text":
             draft["awaiting"] = "yf_text"
-            query.edit_message_text("Введите год «от» текстом (например, 2015 или просто 15):")
+            query.edit_message_text(
+                "Введите год «от» текстом (например, 2015 или просто 15):",
+                reply_markup=back_kb("back:yf"),
+            )
             return
         draft["year_from"] = None if val == "none" else int(val)
         query.edit_message_text("Год до:", reply_markup=year_kb("yt"))
@@ -1394,7 +1454,10 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if val == "text":
             draft["awaiting"] = "yt_text"
-            query.edit_message_text("Введите год «до» текстом (например, 2026 или просто 26):")
+            query.edit_message_text(
+                "Введите год «до» текстом (например, 2026 или просто 26):",
+                reply_markup=back_kb("back:yt"),
+            )
             return
         draft["year_to"] = None if val == "none" else int(val)
         query.edit_message_text("Максимальная цена, ₽:", reply_markup=price_kb())
@@ -1405,7 +1468,11 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if val == "text":
             draft["awaiting"] = "price_text"
-            query.edit_message_text("Введите максимальную цену в рублях текстом (например, 500000):")
+            query.edit_message_text(
+                "Введите максимальную цену в рублях текстом — можно с сокращением, "
+                "например 500000 или 500к (тысяч):",
+                reply_markup=back_kb("back:price"),
+            )
             return
         draft["max_price"] = None if val == "none" else float(val)
         query.edit_message_text(
@@ -1436,19 +1503,22 @@ def on_callback(update: Update, context: CallbackContext):
     if data == "adv:lot":
         draft = DRAFTS.setdefault(chat_id, {})
         draft["awaiting"] = "lot_text"
-        query.edit_message_text("Введите номер лота текстом:")
+        query.edit_message_text("Введите номер лота текстом:", reply_markup=back_kb("adv:menu"))
         return
 
     if data == "adv:vin":
         draft = DRAFTS.setdefault(chat_id, {})
         draft["awaiting"] = "vin_text"
-        query.edit_message_text("Введите VIN / номер рамы текстом (можно частично):")
+        query.edit_message_text("Введите VIN / номер рамы текстом (можно частично):", reply_markup=back_kb("adv:menu"))
         return
 
     if data == "adv:text":
         draft = DRAFTS.setdefault(chat_id, {})
         draft["awaiting"] = "freetext_text"
-        query.edit_message_text("Введите слово/фразу для свободного поиска по описанию лота:")
+        query.edit_message_text(
+            "Введите слово/фразу для свободного поиска по описанию лота:",
+            reply_markup=back_kb("adv:menu"),
+        )
         return
 
     if data == "adv:done":
@@ -1461,10 +1531,12 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if val == "text":
             draft["awaiting"] = "mf_text"
-            query.edit_message_text("Введите пробег «от» числом, км:")
+            query.edit_message_text("Введите пробег «от» числом, км:", reply_markup=back_kb("adv:mileage"))
             return
         draft["mileage_from"] = None if val == "none" else int(val)
-        query.edit_message_text("Пробег до, км:", reply_markup=range_kb("mt", MILEAGE_VALUES, " км"))
+        query.edit_message_text(
+            "Пробег до, км:", reply_markup=range_kb("mt", MILEAGE_VALUES, " км", back="adv:mileage")
+        )
         return
 
     if data.startswith("mt:"):
@@ -1472,7 +1544,7 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if val == "text":
             draft["awaiting"] = "mt_text"
-            query.edit_message_text("Введите пробег «до» числом, км:")
+            query.edit_message_text("Введите пробег «до» числом, км:", reply_markup=back_kb("adv:mileage"))
             return
         draft["mileage_to"] = None if val == "none" else int(val)
         query.edit_message_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
@@ -1483,10 +1555,12 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if val == "text":
             draft["awaiting"] = "ef_text"
-            query.edit_message_text("Введите объём двигателя «от» числом, см³:")
+            query.edit_message_text("Введите объём двигателя «от» числом, см³:", reply_markup=back_kb("adv:engine"))
             return
         draft["engine_from"] = None if val == "none" else int(val)
-        query.edit_message_text("Объём двигателя до, см³:", reply_markup=range_kb("et", ENGINE_VALUES, " см³"))
+        query.edit_message_text(
+            "Объём двигателя до, см³:", reply_markup=range_kb("et", ENGINE_VALUES, " см³", back="adv:engine")
+        )
         return
 
     if data.startswith("et:"):
@@ -1494,7 +1568,7 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if val == "text":
             draft["awaiting"] = "et_text"
-            query.edit_message_text("Введите объём двигателя «до» числом, см³:")
+            query.edit_message_text("Введите объём двигателя «до» числом, см³:", reply_markup=back_kb("adv:engine"))
             return
         draft["engine_to"] = None if val == "none" else int(val)
         query.edit_message_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
@@ -1505,10 +1579,12 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if val == "text":
             draft["awaiting"] = "gf_text"
-            query.edit_message_text("Введите оценку «от» числом (0–9):")
+            query.edit_message_text("Введите оценку «от» числом (0–9):", reply_markup=back_kb("adv:grade"))
             return
         draft["grade_from"] = None if val == "none" else float(val)
-        query.edit_message_text("Оценка состояния до:", reply_markup=range_kb("gt", GRADE_VALUES))
+        query.edit_message_text(
+            "Оценка состояния до:", reply_markup=range_kb("gt", GRADE_VALUES, back="adv:grade")
+        )
         return
 
     if data.startswith("gt:"):
@@ -1516,10 +1592,46 @@ def on_callback(update: Update, context: CallbackContext):
         draft = DRAFTS.setdefault(chat_id, {})
         if val == "text":
             draft["awaiting"] = "gt_text"
-            query.edit_message_text("Введите оценку «до» числом (0–9):")
+            query.edit_message_text("Введите оценку «до» числом (0–9):", reply_markup=back_kb("adv:grade"))
             return
         draft["grade_to"] = None if val == "none" else float(val)
         query.edit_message_text("Доп. фильтры:", reply_markup=adv_menu_kb(draft))
+        return
+
+    # ------------------------------------------------------------------
+    # "Назад" — возврат на ОДИН шаг назад в настройке фильтра, без сброса
+    # уже выбранного (в отличие от "✖ Отмена", которая стирает черновик
+    # целиком). Жалоба живого пользователя: "кнопку назад нужно добавить
+    # везде, чтобы при выборе не того пункта можно было вернуться на
+    # предыдущий список, а не нажимать отмена и начинать всё сначала".
+    # ------------------------------------------------------------------
+
+    if data.startswith("back:"):
+        step = data.split(":", 1)[1]
+        draft = DRAFTS.setdefault(chat_id, {})
+        draft.pop("awaiting", None)
+        if step == "brand":
+            query.edit_message_text("Выберите марку:", reply_markup=brand_kb())
+        elif step == "model":
+            candidates = draft.get("model_candidates", [])
+            brand = draft.get("brand")
+            query.edit_message_text(
+                "Марка: {}\nВыберите модель:".format(brand or "?"),
+                reply_markup=model_kb(candidates, brand=brand),
+            )
+        elif step == "yf":
+            query.edit_message_text("Год от:", reply_markup=year_kb("yf"))
+        elif step == "yt":
+            query.edit_message_text("Год до:", reply_markup=year_kb("yt"))
+        elif step == "price":
+            query.edit_message_text("Максимальная цена, ₽:", reply_markup=price_kb())
+        return
+
+    if data == "statback:brand":
+        draft = DRAFTS.setdefault(chat_id, {})
+        draft.pop("awaiting", None)
+        STAT_STATE.setdefault(chat_id, {})
+        query.edit_message_text("Выберите марку:", reply_markup=stat_brand_kb())
         return
 
     if data == "confirm:save":
