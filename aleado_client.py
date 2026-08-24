@@ -603,6 +603,82 @@ def _do_refresh():
             for brand_lower, counts in brand_model_counts.items()
         }
 
+        # --- ВРЕМЕННО: продолжение диагностики по BMW R1250GS ADVENTURE.
+        # Пользователь резонно указал, что конкретные лоты на jmmoto.ru
+        # (VIN WB10M1106M6E14461 и WB10M1105M6E00986, дата торгов
+        # 2026-08-21 — то есть всего 3 дня назад, а не "старая история")
+        # УЖЕ завершены (проданы/не проданы) и по-прежнему видны на
+        # jmmoto.ru — значит моя прошлая версия объяснения ("jmmoto тянет
+        # из отдельного большого архива") неточна. Более вероятная
+        # причина: сам фид aleado (та же выгрузка, которую видит и
+        # jmmoto) — это "текущий срез" (что идёт сейчас + недавно
+        # завершилось), и завершённые лоты вымываются из него довольно
+        # быстро (за несколько дней), а не хранятся долго — то есть у
+        # jmmoto просто дольше хранится история после того, как лот уже
+        # выпал из "живого" среза, а бот своей истории вообще не копит
+        # (кэш at each refresh полностью перезаписывается). Проверяем
+        # это напрямую: (1) есть ли эти 2 VIN сейчас в фиде вообще (в
+        # любой марке); (2) разброс дат торгов у ЗАВЕРШЁННЫХ лотов —
+        # сколько дней от "самого старого ещё оставшегося" завершённого
+        # лота до сегодня, чтобы измерить реальное окно хранения.
+        try:
+            target_vins = {"wb10m1106m6e14461", "wb10m1105m6e00986"}
+            found_vins = [
+                lot for lot in all_lots
+                if str(lot.get("vin") or "").strip().lower() in target_vins
+            ]
+            log.info(
+                "DEBUG_MODEL2: искомые VIN найдены в текущем фиде: %d из %d — %r",
+                len(found_vins), len(target_vins),
+                [(l.get("vin"), l.get("brand"), l.get("model"), l.get("result")) for l in found_vins],
+            )
+
+            closed_tokens = {"sold", "unsold", "продан", "не продан", "непродан"}
+            closed_dates = []
+            for lot in all_lots:
+                result = str(lot.get("result") or "").strip().lower()
+                if result not in closed_tokens:
+                    continue
+                d = lot.get("auction_date")
+                if d:
+                    closed_dates.append(d)
+            if closed_dates:
+                closed_dates.sort()
+                import datetime as _dt
+                today = _dt.date.today()
+                oldest = closed_dates[0]
+                newest = closed_dates[-1]
+                age_days = (today - oldest).days if hasattr(oldest, "toordinal") else "?"
+                log.info(
+                    "DEBUG_MODEL2: завершённых лотов с датой в текущем фиде: %d; "
+                    "самая старая дата=%r (%s дн. назад), самая новая дата=%r, сегодня=%r",
+                    len(closed_dates), oldest, age_days, newest, today,
+                )
+                # Распределение по "сколько дней назад" — чтобы увидеть окно хранения.
+                from collections import Counter
+                buckets = Counter()
+                for d in closed_dates:
+                    try:
+                        age = (today - d).days
+                    except Exception:
+                        continue
+                    if age <= 1:
+                        buckets["0-1 дн."] += 1
+                    elif age <= 3:
+                        buckets["2-3 дн."] += 1
+                    elif age <= 7:
+                        buckets["4-7 дн."] += 1
+                    elif age <= 14:
+                        buckets["8-14 дн."] += 1
+                    else:
+                        buckets["15+ дн."] += 1
+                log.info("DEBUG_MODEL2: распределение завершённых лотов по возрасту: %r", dict(buckets))
+            else:
+                log.info("DEBUG_MODEL2: завершённых лотов с датой в текущем фиде нет вообще")
+        except Exception:
+            log.exception("DEBUG_MODEL2: диагностика упала")
+        # --- конец временной диагностики
+
         # ВАЖНО: _do_refresh() всегда вызывается из ensure_fresh() уже
         # ВНУТРИ "with _state_lock:" (см. ниже) — тот же самый поток тут
         # повторно брать _state_lock НЕ должен. threading.Lock() не
