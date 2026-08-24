@@ -591,7 +591,6 @@ def _do_refresh():
         # причину.
         try:
             _price_by_auction = {}
-            _target_vins = {"rm48j-000372", "rm50j-000427"}
             for lot in all_lots:
                 raw_price = lot.get("end_price") or lot.get("start_price")
                 try:
@@ -599,26 +598,50 @@ def _do_refresh():
                 except (TypeError, ValueError):
                     val = None
                 auction = (lot.get("auction_name") or "?").strip() or "?"
-                if val is not None:
-                    _price_by_auction.setdefault(auction, []).append(val)
-                vin = (lot.get("vin") or "").strip().lower()
-                if vin in _target_vins:
-                    log.info(
-                        "DEBUG_PRICE: найден лот VIN=%r таблица=%r auction_name=%r "
-                        "start_price=%r end_price=%r result=%r сырая_строка=%r",
-                        lot.get("vin"), lot.get("_table"), lot.get("auction_name"),
-                        lot.get("start_price"), lot.get("end_price"), lot.get("result"),
-                        lot.get("_raw"),
-                    )
-            for auction, vals in sorted(
-                _price_by_auction.items(), key=lambda kv: -len(kv[1])
-            )[:30]:
+                if val is not None and val > 0:
+                    _price_by_auction.setdefault(auction, []).append((val, lot))
+
+            # Гистограмма по "разрядности" ненулевой цены + доля круглых
+            # "похожих на заглушку" значений (0/9999/99999/999999) —
+            # чтобы понять, реальный ли это разброс цен (после ×1000 —
+            # правдоподобный диапазон для мотоцикла) или в основном
+            # мусорные/незаполненные значения.
+            _sentinels = {9999, 99999, 999999, 9999999}
+            for auction, pairs in sorted(_price_by_auction.items(), key=lambda kv: -len(kv[1]))[:10]:
+                vals = [v for v, _ in pairs]
                 vals_sorted = sorted(vals)
                 n = len(vals_sorted)
+                buckets = {}
+                sentinel_count = 0
+                for v in vals:
+                    if int(v) in _sentinels:
+                        sentinel_count += 1
+                    order = len(str(int(v)))
+                    buckets[order] = buckets.get(order, 0) + 1
                 log.info(
-                    "DEBUG_PRICE: auction_name=%r n=%d min=%.0f median=%.0f max=%.0f",
+                    "DEBUG_PRICE: auction_name=%r n=%d min=%.0f median=%.0f max=%.0f "
+                    "разряды(кол-во цифр->шт)=%r заглушек(9999/99999/999999/9999999)=%d",
                     auction, n, vals_sorted[0], vals_sorted[n // 2], vals_sorted[-1],
+                    sorted(buckets.items()), sentinel_count,
                 )
+                # Примеры "обычных" (не заглушка, разряд 2-4 цифры — то,
+                # что при ×1000 попадёт в правдоподобный диапазон
+                # 10 000–9 990 000 иен) строк с их parsed_data — ищем
+                # текстовое подтверждение единиц измерения ("thousand
+                # jpy"/"тысяч иен") внутри отчёта той же строки.
+                examples = [
+                    (v, lot) for v, lot in pairs
+                    if int(v) not in _sentinels and 2 <= len(str(int(v))) <= 4
+                ][:2]
+                for v, lot in examples:
+                    raw = lot.get("_raw") or {}
+                    desc = str(raw.get("parsed_data_en") or "")
+                    log.info(
+                        "DEBUG_PRICE: пример auction_name=%r VIN=%r start_price_raw=%r "
+                        "price_num=%.0f model=%r содержит_'thousand_jpy'=%s",
+                        auction, lot.get("vin"), lot.get("start_price") or lot.get("end_price"),
+                        v, lot.get("model"), "thousand jpy" in desc.lower(),
+                    )
         except Exception:
             log.exception("DEBUG_PRICE: диагностика упала")
         # --- конец временной диагностики
