@@ -603,6 +603,47 @@ def _do_refresh():
             for brand_lower, counts in brand_model_counts.items()
         }
 
+        # --- ВРЕМЕННО: диагностика жалобы "модель BMW R1250GSA видна в
+        # статистике на jmmoto.ru (90 найдено), но её нет в списке
+        # моделей марки BMW в боте — нельзя подписаться". Гипотеза:
+        # "Статистика аукционов" на jmmoto.ru может тянуть данные из
+        # более широкого исторического архива (продажи за долгий
+        # период), а бот строит список моделей только из ТЕКУЩЕГО
+        # снимка фида aleado (moto_lots_ns, ~7-8 тыс. строк текущих/
+        # недавних торгов) — если у R1250GSA сейчас просто нет ни
+        # одного лота в текущем снимке, модель не появится в списке, и
+        # это не баг, а ожидаемое поведение. Логируем: что бот реально
+        # думает про марку BMW (готовый список моделей) + сырой скан
+        # ВСЕХ строк фида на company_en~="bmw" и model~="1250"/"gsa" —
+        # чтобы отличить "модели правда нет в текущем снимке" от "модель
+        # есть, но её почему-то не посчитали".
+        try:
+            log.info(
+                "DEBUG_MODEL: brand_models['bmw'] (%d шт.) = %r",
+                len(brand_models.get("bmw", [])), brand_models.get("bmw", []),
+            )
+            bmw_rows = [
+                lot for lot in all_lots
+                if "bmw" in str(lot.get("brand") or "").strip().lower()
+            ]
+            log.info("DEBUG_MODEL: всего строк с brand~='bmw' в текущем фиде: %d", len(bmw_rows))
+            distinct_models = sorted({str(lot.get("model") or "").strip() for lot in bmw_rows})
+            log.info("DEBUG_MODEL: уникальные значения model среди них (%d шт.): %r", len(distinct_models), distinct_models)
+            gsa_rows = [
+                lot for lot in all_lots
+                if "1250" in str(lot.get("model") or "").lower()
+                or "gsa" in str(lot.get("model") or "").lower().replace(" ", "")
+            ]
+            log.info("DEBUG_MODEL: строк во ВСЁМ фиде (любая марка) с model~='1250' или 'gsa': %d", len(gsa_rows))
+            for lot in gsa_rows[:5]:
+                log.info(
+                    "DEBUG_MODEL: пример VIN=%r brand=%r model=%r result=%r auction_name=%r",
+                    lot.get("vin"), lot.get("brand"), lot.get("model"), lot.get("result"), lot.get("auction_name"),
+                )
+        except Exception:
+            log.exception("DEBUG_MODEL: диагностика упала")
+        # --- конец временной диагностики
+
         # ВАЖНО: _do_refresh() всегда вызывается из ensure_fresh() уже
         # ВНУТРИ "with _state_lock:" (см. ниже) — тот же самый поток тут
         # повторно брать _state_lock НЕ должен. threading.Lock() не
