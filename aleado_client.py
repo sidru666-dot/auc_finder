@@ -579,6 +579,50 @@ def _do_refresh():
                 counts = brand_model_counts.setdefault(brand.lower(), {})
                 counts[model] = counts.get(model, 0) + 1
 
+        # --- ВРЕМЕННО: диагностика бага "цена в боте ×1000 меньше
+        # реальной" (жалоба: Yamaha MT-07-3, VIN RM48J-000372 /
+        # RM50J-000427 — бот показал ¥600 вместо ¥600 000). Гипотеза:
+        # разные аукционные дома в дампе aleado указывают цену в разных
+        # единицах (например, в тысячах иен вместо иен) — тогда медиана
+        # цены по конкретному auction_name будет в ~1000 раз меньше, чем
+        # у остальных. Логируем медиану/мин/макс цены по каждому
+        # auction_name (топ-30 по количеству строк) + сырые данные для
+        # конкретных проблемных VIN — уберём после того, как найдём
+        # причину.
+        try:
+            _price_by_auction = {}
+            _target_vins = {"rm48j-000372", "rm50j-000427"}
+            for lot in all_lots:
+                raw_price = lot.get("end_price") or lot.get("start_price")
+                try:
+                    val = float(str(raw_price).replace(",", "").strip())
+                except (TypeError, ValueError):
+                    val = None
+                auction = (lot.get("auction_name") or "?").strip() or "?"
+                if val is not None:
+                    _price_by_auction.setdefault(auction, []).append(val)
+                vin = (lot.get("vin") or "").strip().lower()
+                if vin in _target_vins:
+                    log.info(
+                        "DEBUG_PRICE: найден лот VIN=%r таблица=%r auction_name=%r "
+                        "start_price=%r end_price=%r result=%r сырая_строка=%r",
+                        lot.get("vin"), lot.get("_table"), lot.get("auction_name"),
+                        lot.get("start_price"), lot.get("end_price"), lot.get("result"),
+                        lot.get("_raw"),
+                    )
+            for auction, vals in sorted(
+                _price_by_auction.items(), key=lambda kv: -len(kv[1])
+            )[:30]:
+                vals_sorted = sorted(vals)
+                n = len(vals_sorted)
+                log.info(
+                    "DEBUG_PRICE: auction_name=%r n=%d min=%.0f median=%.0f max=%.0f",
+                    auction, n, vals_sorted[0], vals_sorted[n // 2], vals_sorted[-1],
+                )
+        except Exception:
+            log.exception("DEBUG_PRICE: диагностика упала")
+        # --- конец временной диагностики
+
         # Раньше модели сортировались по частоте встречаемости (самые
         # ходовые — первыми). Живой пользователь попросил алфавитный
         # порядок — "если знаешь что хочешь XSR, листаешь в конец" —
