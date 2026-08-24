@@ -107,6 +107,65 @@ def init_schema():
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                     """
                 )
+                # bot_known_models — накопленный НАВСЕГДА список (марка,
+                # модель), которые хоть раз встречались в фиде aleado.
+                # Нужен, потому что сам фид — это "текущий срез" (что
+                # ещё идёт/недавно появилось), а не архив: модель, у
+                # которой сейчас нет ни одного лота, полностью пропадает
+                # из кнопок выбора модели, хотя раньше (и, возможно,
+                # снова в будущем) лоты по ней были — живая жалоба:
+                # BMW R1250GS ADVENTURE есть у поставщика данных, но не
+                # находится в кнопках бота, потому что в текущем срезе
+                # по ней временно нет лотов. С этой таблицей кнопка,
+                # once появившись, остаётся навсегда — список моделей
+                # только растёт со временем.
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_known_models (
+                        brand VARCHAR(191) NOT NULL,
+                        model VARCHAR(191) NOT NULL,
+                        first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (brand, model)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    """
+                )
+                # bot_lot_history — своя копия каждого лота, виденного в
+                # фиде, плюс отметка closed_at, когда лот пропадает из
+                # текущего среза (единственный доступный признак
+                # "торги завершились" — сам фид aleado не хранит явный
+                # результат продажи, лот просто исчезает из выдачи).
+                # Нужна на будущее для раздела "Статистика"/"похожие
+                # проданные лоты" — диагностика показала, что в самом
+                # текущем срезе фида завершённых лотов не бывает вообще
+                # (aleado отдаёт только то, что ещё идёт), поэтому без
+                # своей накопленной копии этот раздел показывать
+                # нечего. lot_id — тот же "id" из дампа aleado (он же
+                # используется в ссылках вида jmmoto.ru/<id>), стабилен
+                # между обновлениями фида, пока лот жив.
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_lot_history (
+                        lot_id VARCHAR(64) NOT NULL PRIMARY KEY,
+                        vin VARCHAR(64) NULL,
+                        brand VARCHAR(191) NOT NULL,
+                        model VARCHAR(191) NOT NULL,
+                        year VARCHAR(16) NULL,
+                        auction_name VARCHAR(191) NULL,
+                        auction_date VARCHAR(32) NULL,
+                        mileage_raw VARCHAR(64) NULL,
+                        engine_volume VARCHAR(64) NULL,
+                        grade_overall VARCHAR(32) NULL,
+                        price_raw VARCHAR(64) NULL,
+                        result VARCHAR(64) NULL,
+                        first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        closed_at TIMESTAMP NULL,
+                        INDEX idx_brand_model (brand, model),
+                        INDEX idx_closed (closed_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    """
+                )
                 _migrate_watch_columns(cur)
         finally:
             conn.close()
@@ -257,5 +316,175 @@ def mark_seen_bulk(lot_keys):
     try:
         with conn.cursor() as cur:
             cur.executemany("INSERT IGNORE INTO bot_seen_lots (lot_key) VALUES (%s)", [(k,) for k in lot_keys])
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Накопленный список моделей (bot_known_models) — растущий каталог
+# "марка/модель", которые хоть раз встречались в фиде. См. подробный
+# разбор причины в init_schema() у CREATE TABLE bot_known_models.
+# --------------------------------------------------------------------------
+
+
+def upsert_known_models(pairs):
+    """pairs — итерируемое из (brand, model). Добавляет ещё не виденные
+    пары в bot_known_models и обновляет last_seen_at у уже известных.
+    Список только растёт — записи отсюда никогда не удаляются."""
+    seen = set()
+    clean = []
+    for brand, model in pairs:
+        brand = (brand or "").strip()
+        model = (model or "").strip()
+        if not brand or not model:
+            continue
+        key = (brand.lower(), model.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append((brand, model))
+    if not clean:
+        return
+    init_schema()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO bot_known_models (brand, model) VALUES (%s, %s) "
+                "ON DUPLICATE KEY UPDATE last_seen_at = CURRENT_TIMESTAMP",
+                clean,
+            )
+    finally:
+        conn.close()
+
+
+def known_models_for_brand(brand):
+    """Все модели марки brand, когда-либо встречавшиеся в фиде (не
+    только те, что есть в ТЕКУЩЕМ срезе) — сравнение марки без учёта
+    регистра, раз в самом фиде написание могло не совпасть буква в
+    букву."""
+    init_schema()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT model FROM bot_known_models WHERE LOWER(brand) = LOWER(%s)",
+                (brand,),
+            )
+            return [row["model"] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Своя история лотов (bot_lot_history) — см. подробный разбор причины в
+# init_schema() у CREATE TABLE bot_lot_history. Задел на будущее для
+# раздела "Статистика"/"похожие проданные лоты": сам текущий срез фида
+# завершённых лотов не содержит вообще (подтверждено диагностикой), так
+# что без своей копии этому разделу опираться не на что.
+# --------------------------------------------------------------------------
+
+
+def sync_lot_history(lots):
+    """Синхронизирует bot_lot_history с ТЕКУЩИМ срезом фида: заводит
+    новые строки / обновляет last_seen_at и изменяемые поля у уже
+    известных лотов, а те лоты, что раньше считались "ещё живыми"
+    (closed_at IS NULL), но пропали из текущего среза — помечает
+    closed_at=NOW() (единственный доступный признак завершения торгов,
+    см. комментарий у CREATE TABLE)."""
+    rows = []
+    current_ids = set()
+    for lot in lots:
+        lot_id = lot.get("lot_id")
+        brand = (lot.get("brand") or "").strip()
+        model = (lot.get("model") or "").strip()
+        if not lot_id or not brand or not model:
+            continue
+        lot_id = str(lot_id)
+        current_ids.add(lot_id)
+        rows.append((
+            lot_id,
+            lot.get("vin"),
+            brand,
+            model,
+            str(lot.get("year") or "") or None,
+            lot.get("auction_name"),
+            str(lot.get("auction_date") or "") or None,
+            str(lot.get("mileage") or "") or None,
+            str(lot.get("engine_volume") or "") or None,
+            str(lot.get("grade_overall") or "") or None,
+            str(lot.get("end_price") or lot.get("start_price") or "") or None,
+            str(lot.get("result") or "") or None,
+        ))
+
+    if not rows:
+        return
+
+    init_schema()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            # Кто числится "ещё живым" ДО этого обновления — чтобы
+            # затем понять, кто из них пропал из текущего среза.
+            cur.execute("SELECT lot_id FROM bot_lot_history WHERE closed_at IS NULL")
+            previously_open = {row["lot_id"] for row in cur.fetchall()}
+
+            cur.executemany(
+                """
+                INSERT INTO bot_lot_history
+                    (lot_id, vin, brand, model, year, auction_name, auction_date,
+                     mileage_raw, engine_volume, grade_overall, price_raw, result)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    last_seen_at = CURRENT_TIMESTAMP,
+                    closed_at = NULL,
+                    vin = VALUES(vin),
+                    mileage_raw = VALUES(mileage_raw),
+                    engine_volume = VALUES(engine_volume),
+                    grade_overall = VALUES(grade_overall),
+                    price_raw = VALUES(price_raw),
+                    result = VALUES(result)
+                """,
+                rows,
+            )
+
+            gone = previously_open - current_ids
+            if gone:
+                cur.executemany(
+                    "UPDATE bot_lot_history SET closed_at = CURRENT_TIMESTAMP WHERE lot_id = %s",
+                    [(lid,) for lid in gone],
+                )
+    finally:
+        conn.close()
+
+
+def closed_lot_history(brand, model=None, limit=10):
+    """Последние `limit` лотов марки (и, если задана, модели), которые
+    пропали из текущего среза фида (closed_at IS NOT NULL — наша
+    приближённая замена "проданных/завершённых торгов", раз сам фид
+    aleado эту информацию не хранит). model=None — любая модель этой
+    марки (аналог пункта "Любая модель" в разделе Статистика). Сравнение
+    марки/модели без учёта регистра и лишних пробелов на всякий случай."""
+    init_schema()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            if model:
+                cur.execute(
+                    "SELECT * FROM bot_lot_history "
+                    "WHERE LOWER(brand) = LOWER(%s) AND LOWER(model) = LOWER(%s) "
+                    "AND closed_at IS NOT NULL "
+                    "ORDER BY closed_at DESC LIMIT %s",
+                    (brand.strip(), model.strip(), limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM bot_lot_history "
+                    "WHERE LOWER(brand) = LOWER(%s) "
+                    "AND closed_at IS NOT NULL "
+                    "ORDER BY closed_at DESC LIMIT %s",
+                    (brand.strip(), limit),
+                )
+            return cur.fetchall()
     finally:
         conn.close()

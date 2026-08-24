@@ -512,45 +512,76 @@ def lot_price_label(lot):
 STAT_SAMPLE_SIZE = 10
 
 
-def similar_sold_stats(brand, model, limit=STAT_SAMPLE_SIZE):
-    """Последние `limit` уже завершённых (см. lot_is_open) лотов той же
-    марки и (если модель задана) модели — с ценой, за которую они ушли
-    на аукционе. Модель сравнивается ТОЧНО (не подстрокой) — это те же
-    строки, что показываются кнопками выбора модели, так что сравнение
-    честное и не смешивает разные модели вместе.
+def _closed_row_to_lot(row):
+    """Приводит строку своей накопленной истории (bot_lot_history, см.
+    db.py) к виду обычного словаря лота — с теми же ключами, что и у
+    лота из живого фида — чтобы format_mileage/lot_price_label/
+    lot_year и т.п. работали без переделки, независимо от источника."""
+    return {
+        "brand": row.get("brand"),
+        "model": row.get("model"),
+        "year": row.get("year"),
+        "mileage": row.get("mileage_raw"),
+        "engine_volume": row.get("engine_volume"),
+        "grade_overall": row.get("grade_overall"),
+        "start_price": row.get("price_raw"),
+        "end_price": None,
+        "result": row.get("result"),
+        "auction_date": row.get("auction_date"),
+        "vin": row.get("vin"),
+        "auction_name": row.get("auction_name"),
+    }
 
-    ВАЖНО: цена здесь — это цена аукциона В ЯПОНИИ (йены, пересчёт в
-    рубли по курсу ЦБ) — БЕЗ растаможки, логистики и доставки до России.
-    Настоящая "цена под ключ в РФ" (как на jmmoto.ru/auc-stat) требует
-    отдельного расчёта пошлин/доставки, которого в этом фиде нет — эта
-    цифра только для примерной ориентировки по уровню цены на торгах.
+
+def similar_sold_stats(brand, model, limit=STAT_SAMPLE_SIZE):
+    """Последние `limit` завершённых лотов той же марки и (если модель
+    задана) модели — с ценой, за которую они шли на момент, пока лот
+    ещё был жив в фиде. Модель сравнивается ТОЧНО (не подстрокой) — это
+    те же строки, что показываются кнопками выбора модели, так что
+    сравнение честное и не смешивает разные модели вместе.
+
+    ВАЖНО: сам фид aleado результат торгов (продан/не продан) не
+    хранит — как только торги проходят, лот просто исчезает из выдачи
+    (подтверждено диагностикой: в текущем срезе фида завершённых лотов
+    не бывает вообще). Поэтому данные берутся из СВОЕЙ накопленной
+    истории (db.closed_lot_history) — бот сам копит копию каждого
+    увиденного лота и, когда лот пропадает из текущего среза, считает
+    его завершённым (closed_at). Пока бот не проработал какое-то время,
+    здесь может быть мало данных или не быть их вовсе — это НАКАПЛИ-
+    ВАЕМАЯ история, а не мгновенный снимок.
+
+    Цена здесь — это цена аукциона В ЯПОНИИ (йены, пересчёт в рубли по
+    курсу ЦБ) на момент, когда лот последний раз был виден живым — БЕЗ
+    растаможки, логистики и доставки до России. Настоящая "цена под
+    ключ в РФ" (как на jmmoto.ru/auc-stat) требует отдельного расчёта
+    пошлин/доставки, которого в этом фиде нет — эта цифра только для
+    примерной ориентировки по уровню цены на торгах.
 
     Возвращает None, если подходящих завершённых лотов не нашлось,
     иначе словарь с count/median_rub/min_rub/max_rub/sample."""
-    brand_l = _norm_text(brand).lower()
-    if not brand_l:
+    brand_s = _norm_text(brand)
+    if not brand_s:
         return None
-    model_l = _norm_text(model).lower()
+    model_s = _norm_text(model) or None
+
+    try:
+        closed_rows = db.closed_lot_history(brand_s, model_s, limit=limit)
+    except Exception:
+        log.exception("similar_sold_stats: не удалось прочитать накопленную историю из своей базы")
+        closed_rows = []
 
     rows = []
-    for lot in aleado.get_lots():
-        if _norm_text(lot.get("brand")).lower() != brand_l:
-            continue
-        if model_l and _norm_text(lot.get("model")).lower() != model_l:
-            continue
-        if lot_is_open(lot):
-            continue
+    for row in closed_rows:
+        lot = _closed_row_to_lot(row)
         price = lot_price_rub(lot)
         if price is None:
             continue
-        rows.append((str(lot.get("auction_date") or ""), lot, price))
+        rows.append((str(row.get("auction_date") or ""), lot, price))
 
     if not rows:
         return None
 
-    rows.sort(key=lambda r: r[0], reverse=True)
-    top = rows[:limit]
-    prices = sorted(p for _, _, p in top)
+    prices = sorted(p for _, _, p in rows)
     n = len(prices)
     median = prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2
 
@@ -559,7 +590,7 @@ def similar_sold_stats(brand, model, limit=STAT_SAMPLE_SIZE):
         "median_rub": median,
         "min_rub": prices[0],
         "max_rub": prices[-1],
-        "sample": top,
+        "sample": rows,
     }
 
 
@@ -584,7 +615,8 @@ def format_stats_text(brand, model, stats):
     model_s = model or "любая модель"
     if not stats:
         return (
-            "По «{} / {}» завершённых торгов в текущих данных фида пока нет.".format(
+            "По «{} / {}» завершённых торгов в накопленной истории пока нет — "
+            "данные копятся со временем по мере работы бота.".format(
                 html.escape(brand), html.escape(model_s)
             )
         )
@@ -618,13 +650,64 @@ def format_stats_text(brand, model, stats):
     return "\n".join(lines)
 
 
+# Человеко-читаемые подписи для "доп. оценок" узлов мотоцикла. Сырые
+# имена колонок в дампе aleado (вида "engine_score_en", "frame_score_en")
+# сами по себе нечитаемы для пользователя — жалоба живого пользователя
+# (переслано в чат): сообщение бота превращалось в "кашу" из технических
+# имён колонок, слитых через запятую в одну строку ("engine_score_en: 5,
+# front_score_en: 4, ..."). Ключ — нормализованное имя колонки (нижний
+# регистр, без суффиксов _en/_ru и без слов score/grade), значение —
+# русская подпись узла.
+_GRADE_LABELS = {
+    "engine": "двигатель",
+    "front": "перед",
+    "rear": "зад",
+    "exterior": "экстерьер",
+    "interior": "салон",
+    "electricity": "электрика",
+    "electric": "электрика",
+    "frame": "рама",
+    "body": "кузов",
+    "tank": "бак",
+    "wheel": "колёса",
+    "wheels": "колёса",
+    "suspension": "подвеска",
+    "brake": "тормоза",
+    "brakes": "тормоза",
+    "paint": "окраска",
+    "muffler": "глушитель",
+    "exhaust": "выхлоп",
+    "seat": "сиденье",
+    "handle": "руль",
+    "meter": "приборы",
+}
+
+
+def _prettify_grade_column(col):
+    """Из сырого имени колонки вроде "engine_score_en" делает читаемую
+    русскую подпись узла ("двигатель"). Для незнакомого имени колонки —
+    хотя бы убирает служебные суффиксы/подчёркивания, чтобы было читаемо,
+    вместо того чтобы показывать имя колонки как есть."""
+    key = re.sub(r"(^|_)(score|grade|балл|оцен\w*)(_|$)", "_", col.lower())
+    key = key.strip("_")
+    key = re.sub(r"_(en|ru)$", "", key)
+    if key in _GRADE_LABELS:
+        return _GRADE_LABELS[key]
+    if not key:
+        return col
+    return key.replace("_", " ").strip().capitalize()
+
+
 def lot_grade_label(lot):
+    """Список читаемых строк "узел: оценка" (например ["двигатель: 5",
+    "рама: 4"]) — каждая выводится в format_lot_text() ОТДЕЛЬНОЙ строкой,
+    вместо старой "каши" из сырых имён колонок, слитых запятыми в одну
+    строку. Общая оценка (grade_overall) сюда не входит — она уже
+    выводится отдельной строкой "Оценка состояния" в format_lot_text()."""
     parts = []
-    if lot.get("grade_overall"):
-        parts.append("общая: {}".format(lot["grade_overall"]))
     for col, val in (lot.get("_extra_grades") or {}).items():
-        parts.append("{}: {}".format(col, val))
-    return ", ".join(parts) if parts else None
+        parts.append("{}: {}".format(_prettify_grade_column(col), val))
+    return parts
 
 
 # Реальные фото лота (поле pictures у aleado) склеены знаком "#", а НЕ
@@ -735,46 +818,65 @@ def model_button_label(model, brand, max_len=26):
 
 
 def format_lot_text(lot, brand, model, year):
+    """Карточка лота для показа пользователю — отдельными пунктами по
+    смысловым блокам (с пустой строкой между блоками), а не слитными
+    строками через запятую. Раньше все параметры одного блока (пробег,
+    объём, цвет, тип и т.п.) склеивались в одну строку через запятую, а
+    доп. оценки узлов показывались сырыми именами колонок из фида — по
+    жалобе живого пользователя (переслано в чат) это выглядело "кашей" и
+    было неудобно читать: "А по каждому пункту отдельно выдавал в новом
+    предложении, чтобы удобнее было смотреть, без каши"."""
     name = lot_display_name(lot)
     lines = ["🏍 <b>{}</b>".format(html.escape(name or "Мотоцикл"))]
-    lines.append("Год: {} | Цена: {}".format(year or "?", html.escape(lot_price_label(lot))))
+    lines.append("")
+    lines.append("Год: {}".format(year or "?"))
+    lines.append("Цена: {}".format(html.escape(lot_price_label(lot))))
 
-    grade = lot_grade_label(lot)
-    if grade:
-        lines.append("Оценка состояния: {}".format(html.escape(grade)))
+    if lot.get("grade_overall"):
+        lines.append("Оценка состояния (общая): {}".format(html.escape(str(lot["grade_overall"]))))
+    for part in lot_grade_label(lot):
+        lines.append(html.escape(part))
 
-    meta = []
+    details = []
     mileage = format_mileage(lot.get("mileage"))
     if mileage:
-        meta.append("пробег {}".format(mileage))
+        details.append("Пробег: {}".format(mileage))
     if lot.get("engine_volume"):
-        meta.append("объём {}".format(lot["engine_volume"]))
+        details.append("Объём двигателя: {}".format(lot["engine_volume"]))
     if lot.get("color"):
-        meta.append("цвет {}".format(lot["color"]))
+        details.append("Цвет: {}".format(lot["color"]))
     if lot.get("body_type"):
-        meta.append("тип {}".format(lot["body_type"]))
-    if meta:
-        lines.append(html.escape(", ".join(meta)))
+        details.append("Тип: {}".format(lot["body_type"]))
+    if details:
+        lines.append("")
+        lines.extend(html.escape(d) for d in details)
 
     aux = []
     if lot.get("auction_name"):
-        aux.append("аукцион {}".format(lot["auction_name"]))
+        aux.append("Аукцион: {}".format(lot["auction_name"]))
     if lot.get("auction_date"):
-        aux.append("дата {}".format(lot["auction_date"]))
+        aux.append("Дата: {}".format(lot["auction_date"]))
     if lot.get("lot_number"):
-        aux.append("лот №{}".format(lot["lot_number"]))
+        aux.append("Лот №{}".format(lot["lot_number"]))
     if aux:
-        lines.append(html.escape(", ".join(aux)))
+        lines.append("")
+        lines.extend(html.escape(a) for a in aux)
 
+    tail = []
     if lot.get("vin"):
-        lines.append("VIN: {}".format(html.escape(str(lot["vin"]))))
+        tail.append("VIN: {}".format(html.escape(str(lot["vin"]))))
     if lot.get("result"):
-        lines.append("Результат торгов: {}".format(html.escape(str(lot["result"]))))
+        tail.append("Результат торгов: {}".format(html.escape(str(lot["result"]))))
+    if tail:
+        lines.append("")
+        lines.extend(tail)
 
     stats_line = format_stats_block(similar_sold_stats(brand, model))
     if stats_line:
+        lines.append("")
         lines.append(html.escape(stats_line))
 
+    lines.append("")
     lines.append(
         '<a href="{}">Смотреть на jmmoto.ru</a> | Источник: aleado (Япония)'.format(
             html.escape(lot_jmmoto_url(lot), quote=True)

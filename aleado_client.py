@@ -517,6 +517,25 @@ def _build_lot(table, resolved, extra_grade_cols, raw):
     return lot
 
 
+# Сортировка модели по НОРМАЛИЗОВАННОМУ виду (пробелы схлопнуты,
+# повторяющаяся марка спереди срезана), а не по сырой строке из фида —
+# так порядок совпадает с тем, что реально показано на кнопках (см.
+# model_button_label в bot_server.py), а не с сырым текстом вроде
+# " TRIUMPH  TIGER 900 RALLY PRO" (там алфавитный порядок по сырой
+# строке был бы бессмысленным — она вся начиналась бы на "TRIUMPH").
+# Вынесено на уровень модуля (было вложенной функцией внутри
+# _do_refresh) — теперь используется и там, и в get_brand_models() для
+# сортировки объединённого списка (текущий срез фида + накопленная в
+# своей базе история моделей, см. db.known_models_for_brand).
+def _model_sort_key(model, brand_lower):
+    m = re.sub(r"\s+", " ", (model or "").strip())
+    if m.upper().startswith(brand_lower.upper()):
+        rest = m[len(brand_lower):].lstrip(" -_/")
+        if rest:
+            m = rest
+    return m.upper()
+
+
 def _do_refresh():
     tmp_dir = tempfile.mkdtemp(prefix="aleado_dump_")
     try:
@@ -579,105 +598,31 @@ def _do_refresh():
                 counts = brand_model_counts.setdefault(brand.lower(), {})
                 counts[model] = counts.get(model, 0) + 1
 
-        # Раньше модели сортировались по частоте встречаемости (самые
-        # ходовые — первыми). Живой пользователь попросил алфавитный
-        # порядок — "если знаешь что хочешь XSR, листаешь в конец" —
-        # по частоте так не сориентироваться, а по алфавиту это
-        # предсказуемо. Сортируем по НОРМАЛИЗОВАННОМУ виду (пробелы
-        # схлопнуты, повторяющаяся марка спереди срезана), а не по
-        # сырой строке из фида — так порядок совпадает с тем, что
-        # реально показано на кнопках (см. model_button_label в
-        # bot_server.py), а не с сырым текстом вроде " TRIUMPH  TIGER
-        # 900 RALLY PRO" (там алфавитный порядок по сырой строке был бы
-        # бессмысленным — она вся начиналась бы на "TRIUMPH").
-        def _model_sort_key(model, brand_lower):
-            m = re.sub(r"\s+", " ", (model or "").strip())
-            if m.upper().startswith(brand_lower.upper()):
-                rest = m[len(brand_lower):].lstrip(" -_/")
-                if rest:
-                    m = rest
-            return m.upper()
+        # Копим (марка, модель) в СВОЮ базу навсегда — раз модель где-то
+        # встретилась в фиде, кнопка для неё остаётся в списке, даже
+        # если сейчас в текущем срезе фида по ней нет ни одного лота
+        # (сам фид aleado — это "текущий срез", а не архив, см. подробный
+        # разбор в db.py у bot_known_models). Плюс копим саму историю
+        # лотов (bot_lot_history) — на будущее, чтобы раздел
+        # "Статистика"/"похожие проданные лоты" могли когда-нибудь
+        # опираться на СВОИ накопленные данные, а не только на текущий
+        # срез (в котором, как показала диагностика, завершённых лотов
+        # не бывает вообще — aleado отдаёт только то, что ещё идёт).
+        # Обе операции по сети — оборачиваем в try/except, чтобы сбой
+        # записи в свою базу (например, кратковременная недоступность
+        # MySQL) не ронял обновление всего кэша фида.
+        try:
+            db.upsert_known_models(
+                (lot.get("brand"), lot.get("model")) for lot in all_lots
+            )
+            db.sync_lot_history(all_lots)
+        except Exception:
+            log.exception("aleado: не удалось обновить накопленную историю моделей/лотов в своей базе")
 
         brand_models = {
             brand_lower: sorted(counts.keys(), key=lambda m: _model_sort_key(m, brand_lower))
             for brand_lower, counts in brand_model_counts.items()
         }
-
-        # --- ВРЕМЕННО: продолжение диагностики по BMW R1250GS ADVENTURE.
-        # Пользователь резонно указал, что конкретные лоты на jmmoto.ru
-        # (VIN WB10M1106M6E14461 и WB10M1105M6E00986, дата торгов
-        # 2026-08-21 — то есть всего 3 дня назад, а не "старая история")
-        # УЖЕ завершены (проданы/не проданы) и по-прежнему видны на
-        # jmmoto.ru — значит моя прошлая версия объяснения ("jmmoto тянет
-        # из отдельного большого архива") неточна. Более вероятная
-        # причина: сам фид aleado (та же выгрузка, которую видит и
-        # jmmoto) — это "текущий срез" (что идёт сейчас + недавно
-        # завершилось), и завершённые лоты вымываются из него довольно
-        # быстро (за несколько дней), а не хранятся долго — то есть у
-        # jmmoto просто дольше хранится история после того, как лот уже
-        # выпал из "живого" среза, а бот своей истории вообще не копит
-        # (кэш at each refresh полностью перезаписывается). Проверяем
-        # это напрямую: (1) есть ли эти 2 VIN сейчас в фиде вообще (в
-        # любой марке); (2) разброс дат торгов у ЗАВЕРШЁННЫХ лотов —
-        # сколько дней от "самого старого ещё оставшегося" завершённого
-        # лота до сегодня, чтобы измерить реальное окно хранения.
-        try:
-            target_vins = {"wb10m1106m6e14461", "wb10m1105m6e00986"}
-            found_vins = [
-                lot for lot in all_lots
-                if str(lot.get("vin") or "").strip().lower() in target_vins
-            ]
-            log.info(
-                "DEBUG_MODEL2: искомые VIN найдены в текущем фиде: %d из %d — %r",
-                len(found_vins), len(target_vins),
-                [(l.get("vin"), l.get("brand"), l.get("model"), l.get("result")) for l in found_vins],
-            )
-
-            closed_tokens = {"sold", "unsold", "продан", "не продан", "непродан"}
-            closed_dates = []
-            for lot in all_lots:
-                result = str(lot.get("result") or "").strip().lower()
-                if result not in closed_tokens:
-                    continue
-                d = lot.get("auction_date")
-                if d:
-                    closed_dates.append(d)
-            if closed_dates:
-                closed_dates.sort()
-                import datetime as _dt
-                today = _dt.date.today()
-                oldest = closed_dates[0]
-                newest = closed_dates[-1]
-                age_days = (today - oldest).days if hasattr(oldest, "toordinal") else "?"
-                log.info(
-                    "DEBUG_MODEL2: завершённых лотов с датой в текущем фиде: %d; "
-                    "самая старая дата=%r (%s дн. назад), самая новая дата=%r, сегодня=%r",
-                    len(closed_dates), oldest, age_days, newest, today,
-                )
-                # Распределение по "сколько дней назад" — чтобы увидеть окно хранения.
-                from collections import Counter
-                buckets = Counter()
-                for d in closed_dates:
-                    try:
-                        age = (today - d).days
-                    except Exception:
-                        continue
-                    if age <= 1:
-                        buckets["0-1 дн."] += 1
-                    elif age <= 3:
-                        buckets["2-3 дн."] += 1
-                    elif age <= 7:
-                        buckets["4-7 дн."] += 1
-                    elif age <= 14:
-                        buckets["8-14 дн."] += 1
-                    else:
-                        buckets["15+ дн."] += 1
-                log.info("DEBUG_MODEL2: распределение завершённых лотов по возрасту: %r", dict(buckets))
-            else:
-                log.info("DEBUG_MODEL2: завершённых лотов с датой в текущем фиде нет вообще")
-        except Exception:
-            log.exception("DEBUG_MODEL2: диагностика упала")
-        # --- конец временной диагностики
 
         # ВАЖНО: _do_refresh() всегда вызывается из ensure_fresh() уже
         # ВНУТРИ "with _state_lock:" (см. ниже) — тот же самый поток тут
@@ -754,12 +699,40 @@ def get_lots(table=None):
 
 def get_brand_models(brand, limit=None):
     """Названия моделей марки brand, отсортированные по алфавиту (по
-    нормализованному виду — см. _model_sort_key в _do_refresh) — из
-    готового индекса, посчитанного один раз при обновлении фида (см.
-    _do_refresh), вместо повторного прохода по всем лотам на каждый
-    клик. Раньше сортировка была по частоте встречаемости, но так
-    сложно ориентироваться, зная точное название модели — алфавитный
-    порядок предсказуемее."""
+    нормализованному виду — см. _model_sort_key) — ОБЪЕДИНЕНИЕ текущего
+    среза фида (посчитан один раз при обновлении, см. _do_refresh) и
+    накопленной истории моделей в своей базе (bot_known_models, см.
+    db.py).
+
+    Раньше список был только из текущего среза — а сам фид aleado, как
+    выяснилось, отдаёт только то, что ещё идёт/недавно появилось, и
+    завершившиеся/временно отсутствующие модели пропадали из кнопок
+    полностью (живая жалоба: BMW R1250GS ADVENTURE есть на сайте
+    поставщика, но в кнопках бота её было не найти — конкретно у этой
+    модели сейчас просто нет лотов в текущем срезе). Теперь модель,
+    once увиденная в фиде, остаётся в кнопках навсегда — список только
+    растёт. При конфликте написания (лишний пробел и т.п.) побеждает
+    написание из ТЕКУЩЕГО среза, если модель в нём тоже есть — это то,
+    что реально сейчас в фиде, а не то, что запомнилось раньше."""
     ensure_fresh()
-    models = _cache["brand_models"].get(brand.strip().lower(), [])
-    return models[:limit] if limit else list(models)
+    brand = (brand or "").strip()
+    current = _cache["brand_models"].get(brand.lower(), [])
+
+    try:
+        historical = db.known_models_for_brand(brand)
+    except Exception:
+        log.exception("aleado: не удалось прочитать накопленную историю моделей из своей базы")
+        historical = []
+
+    merged = {}
+    for m in historical:
+        key = re.sub(r"\s+", " ", (m or "").strip()).lower()
+        if key:
+            merged[key] = m
+    for m in current:
+        key = re.sub(r"\s+", " ", (m or "").strip()).lower()
+        if key:
+            merged[key] = m  # текущий срез перезаписывает — актуальное написание в приоритете
+
+    models = sorted(merged.values(), key=lambda m: _model_sort_key(m, brand))
+    return models[:limit] if limit else models
