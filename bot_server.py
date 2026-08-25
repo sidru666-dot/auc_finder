@@ -1453,10 +1453,23 @@ def on_callback(update: Update, context: CallbackContext):
     if data.startswith("del:"):
         wid = int(data.split(":", 1)[1])
         changed = db.delete_watch(wid, chat_id)
-        if changed:
-            query.edit_message_text("Удалено.")
+        text, kb = mywatches_view(chat_id)
+        if not kb:
+            note = "Удалено." if changed else "Не найдено (возможно, уже удалено)."
+            note += " Сохранённых оповещений больше нет."
+            try:
+                query.edit_message_text(note, reply_markup=main_menu_kb())
+            except Exception:
+                pass
         else:
-            query.edit_message_text("Не найдено (возможно, уже удалено).")
+            prefix = (
+                "✅ Удалено #{}.\n\n".format(wid) if changed
+                else "⚠️ Фильтр #{} не найден (возможно, уже удалено).\n\n".format(wid)
+            )
+            try:
+                query.edit_message_text(prefix + text, reply_markup=kb)
+            except Exception:
+                pass
         return
 
     if data == "morelots":
